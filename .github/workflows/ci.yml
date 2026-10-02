@@ -21,7 +21,7 @@ jobs:
       matrix:
         os: [windows-2022, windows-2025]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -37,7 +37,7 @@ jobs:
     name: msrv (1.77)
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.77
       - run: cargo check --lib
 
@@ -49,7 +49,7 @@ jobs:
       matrix:
         target: [aarch64-pc-windows-msvc, i686-pc-windows-msvc, x86_64-pc-windows-gnu]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -60,7 +60,7 @@ jobs:
     name: builds empty on Linux
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test
       - run: cargo package --allow-dirty

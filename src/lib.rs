@@ -89,3 +89,9 @@ pub use session::{
     SessionProcess,
 };
 pub use token::PrimaryToken;
+
+// Builds the README examples as doctests, so the front page cannot drift from
+// the API.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
