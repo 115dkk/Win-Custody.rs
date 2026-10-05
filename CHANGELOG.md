@@ -4,6 +4,13 @@ All notable changes to this crate are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.1.1 - 2026-10-05
+
+### Added
+
+- `SECURITY.md`: report vulnerabilities through GitHub's private
+  vulnerability reporting. The file now ships in the package.
+
 ## 0.1.0 - 2026-10-02
 
 First release.
