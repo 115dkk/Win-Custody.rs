@@ -5,16 +5,21 @@ use std::ffi::OsString;
 use std::io;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStringExt;
+use std::path::Path;
 use std::ptr;
 
 use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Globalization::lstrlenW;
-use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW,
+    EXPLICIT_ACCESS_W, SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_GROUP, TRUSTEE_IS_SID, TRUSTEE_W,
+};
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{
-    DeriveCapabilitySidsFromName, FreeSid, PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
+    DeriveCapabilitySidsFromName, FreeSid, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
+    OBJECT_INHERIT_ACE, PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
 };
 
 use crate::wide::wide_null;
@@ -146,6 +151,16 @@ impl AppContainerProfile {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SID string was not Unicode"))
     }
 
+    /// Adds an inheritable access rule for this profile to an existing file
+    /// or directory DACL without replacing its other access rules.
+    ///
+    /// The ACE is inherited by children created later. Call this for every
+    /// existing path that needs access. `ReadWrite` also grants delete access
+    /// so a child can replace files inside an approved writable directory.
+    pub fn grant_path(&self, path: impl AsRef<Path>, access: AppContainerAccess) -> io::Result<()> {
+        grant_sid_access(path.as_ref(), self.sid.0, access)
+    }
+
     pub(crate) fn security_capabilities(&self) -> SECURITY_CAPABILITIES {
         SECURITY_CAPABILITIES {
             AppContainerSid: self.sid.0,
@@ -157,6 +172,92 @@ impl AppContainerProfile {
             CapabilityCount: self.capability_attributes.len() as u32,
             Reserved: 0,
         }
+    }
+}
+
+/// Filesystem rights granted by [`AppContainerProfile::grant_path`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AppContainerAccess {
+    /// Read and execute access.
+    Read,
+    /// Read, write, execute, and delete access.
+    ReadWrite,
+}
+
+fn grant_sid_access(path: &Path, sid: PSID, access: AppContainerAccess) -> io::Result<()> {
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const DELETE: u32 = 0x0001_0000;
+    let path = wide_null(path.as_os_str())?;
+    let mut old_dacl: *mut ACL = ptr::null_mut();
+    let mut descriptor = ptr::null_mut();
+    // SAFETY: `path` is NUL-terminated and both outputs are local pointers;
+    // Windows returns a LocalAlloc descriptor owned by the guard below.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut old_dacl,
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let _descriptor = LocalBlock(descriptor.cast());
+    let entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: match access {
+            AppContainerAccess::Read => GENERIC_READ,
+            AppContainerAccess::ReadWrite => GENERIC_READ | GENERIC_WRITE | DELETE,
+        },
+        grfAccessMode: SET_ACCESS,
+        grfInheritance: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: ptr::null_mut(),
+            MultipleTrusteeOperation: 0,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_GROUP,
+            ptstrName: sid.cast(),
+        },
+    };
+    let mut new_dacl: *mut ACL = ptr::null_mut();
+    // SAFETY: `entry` points at the live SID owned by `self`; `old_dacl` is
+    // part of the live descriptor, and `new_dacl` is a local output pointer.
+    let status = unsafe { SetEntriesInAclW(1, &entry, old_dacl, &mut new_dacl) };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let _new_dacl = LocalBlock(new_dacl.cast());
+    // SAFETY: the path, descriptor and new DACL all stay live for this call;
+    // only the object's DACL is changed, preserving its owner and other ACLs.
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            path.as_ptr().cast_mut(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            new_dacl,
+            ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    Ok(())
+}
+
+struct LocalBlock(*mut std::ffi::c_void);
+
+impl Drop for LocalBlock {
+    fn drop(&mut self) {
+        // SAFETY: the block is allocated by GetNamedSecurityInfoW or
+        // SetEntriesInAclW and is freed exactly once with LocalFree.
+        unsafe { LocalFree(self.0) };
     }
 }
 

@@ -74,7 +74,7 @@ mod session;
 mod token;
 mod wide;
 
-pub use app_container::AppContainerProfile;
+pub use app_container::{AppContainerAccess, AppContainerProfile};
 pub use handle::{wait, WaitOutcome};
 pub use job::{Job, JobLimits};
 pub use launch::{anonymous_pipe, null_device, read_to_end_bounded, Launch, SuspendedChild};

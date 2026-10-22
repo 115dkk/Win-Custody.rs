@@ -939,16 +939,28 @@ mod tests {
 
     #[test]
     fn an_appcontainer_child_is_assigned_before_resume_and_keeps_captured_stdio() {
+        use crate::AppContainerAccess;
+
         let profile = crate::AppContainerProfile::create_or_open(
             &format!("win-custody-test-{}", std::process::id()),
             "Win Custody test",
             "Win Custody AppContainer launch test",
         )
         .unwrap();
-        let job = Job::create(&JobLimits::new().kill_on_close(true)).unwrap();
+        assert!(profile.sid_string().unwrap().starts_with("S-1-15-2-"));
+        let directory = tempfile::tempdir().unwrap();
+        profile
+            .grant_path(directory.path(), AppContainerAccess::ReadWrite)
+            .unwrap();
+        let job = Job::create(&JobLimits::new().kill_on_close(true).active_processes(1)).unwrap();
         let (read, write) = anonymous_pipe().unwrap();
         let child = Launch::new(cmd())
-            .args(["/d", "/c", "echo appcontainer-ok"])
+            .args([
+                "/d",
+                "/c",
+                "echo appcontainer-ok > marker.txt & type marker.txt",
+            ])
+            .current_dir(directory.path())
             .app_container(&profile)
             .stdout(&write)
             .spawn_in_job(&job)
@@ -961,6 +973,12 @@ mod tests {
             WaitOutcome::Signaled
         );
         assert_eq!(String::from_utf8_lossy(&output).trim(), "appcontainer-ok");
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("marker.txt"))
+                .unwrap()
+                .trim(),
+            "appcontainer-ok"
+        );
     }
 
     #[test]
