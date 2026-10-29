@@ -13,7 +13,7 @@ use std::ffi::c_void;
 use std::io;
 use std::marker::PhantomData;
 use std::mem::size_of;
-use std::os::windows::io::{AsHandle, AsRawHandle, OwnedHandle};
+use std::os::windows::io::{AsHandle, AsRawHandle, OwnedHandle, RawHandle};
 use std::path::Path;
 use std::ptr::{self, NonNull};
 
@@ -332,7 +332,12 @@ impl Drop for ObjectSecurityDescriptor {
 /// The calling process's user SID in string form, such as `S-1-5-18`.
 pub fn current_user_sid_string() -> io::Result<String> {
     let token = open_current_process_token(TOKEN_QUERY)?;
-    let raw = token.as_raw_handle();
+    token_user_sid_string(token.as_raw_handle())
+}
+
+/// The user SID of the token `raw`, in string form. The handle must be live
+/// and opened with `TOKEN_QUERY`.
+pub(crate) fn token_user_sid_string(raw: RawHandle) -> io::Result<String> {
     let information = probe_word_aligned(
         size_of::<TOKEN_USER>(),
         MAX_TOKEN_INFORMATION_BYTES,

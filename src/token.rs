@@ -132,6 +132,16 @@ impl PrimaryToken {
         token_is_elevated(self.raw())
     }
 
+    /// The token's user SID in string form, such as `S-1-5-21-...`.
+    ///
+    /// For a token from [`for_session_user`](Self::for_session_user) this is
+    /// the user logged on to that session. It is the token user, not the
+    /// token's default owner, which is `BUILTIN\Administrators` for an
+    /// unfiltered administrator token.
+    pub fn user_sid_string(&self) -> io::Result<String> {
+        crate::security::token_user_sid_string(self.raw())
+    }
+
     fn raw(&self) -> RawHandle {
         self.0.as_raw_handle()
     }
@@ -178,6 +188,14 @@ mod tests {
             token.is_elevated().unwrap(),
             crate::process::is_elevated().unwrap()
         );
+    }
+
+    #[test]
+    fn a_duplicate_of_the_own_token_has_the_own_user() {
+        let token = PrimaryToken::duplicate_current_process().unwrap();
+        let sid = token.user_sid_string().unwrap();
+        assert_eq!(sid, crate::security::current_user_sid_string().unwrap());
+        assert!(sid.starts_with("S-1-"), "{sid}");
     }
 
     #[test]
