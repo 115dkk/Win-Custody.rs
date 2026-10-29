@@ -4,6 +4,15 @@ All notable changes to this crate are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.1.2 - 2026-10-29
+
+### Added
+
+- `PrimaryToken::user_sid_string`: the token user's SID in string form, for
+  example the user logged on to the session of a token from
+  `PrimaryToken::for_session_user`. Until now only the calling process's own
+  user SID was available (`current_user_sid_string`).
+
 ## 0.1.1 - 2026-10-05
 
 ### Added
