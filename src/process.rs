@@ -14,7 +14,7 @@ use windows_sys::Win32::Foundation::{
     DuplicateHandle, DUPLICATE_SAME_ACCESS, FILETIME, STILL_ACTIVE,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    GetTokenInformation, TokenElevation, TokenIsAppContainer, TOKEN_ELEVATION, TOKEN_QUERY,
 };
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::System::Threading::{
@@ -224,6 +224,40 @@ impl Process {
             }
         }
         Ok(Some(exit_code))
+    }
+
+    /// Whether this process token is an AppContainer token.
+    pub fn is_app_container(&self) -> io::Result<bool> {
+        let mut token = ptr::null_mut();
+        // SAFETY: `self` owns a live process handle and `token` is a local
+        // output pointer. The returned token handle is owned below.
+        if unsafe { OpenProcessToken(self.handle.as_raw_handle(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let token = owned_from_creation(token)?;
+        let mut is_app_container = 0_u32;
+        let mut returned = 0_u32;
+        // SAFETY: `token` is live and both output pointers name initialized
+        // local storage of the documented sizes.
+        if unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenIsAppContainer,
+                (&mut is_app_container as *mut u32).cast(),
+                size_of::<u32>() as u32,
+                &mut returned,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if returned as usize != size_of::<u32>() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows returned a truncated AppContainer token flag",
+            ));
+        }
+        Ok(is_app_container != 0)
     }
 
     /// The full Win32 path of the process image.

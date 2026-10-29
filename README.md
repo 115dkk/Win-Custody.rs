@@ -13,6 +13,7 @@ owned types.
 | inherit exactly the handles you name, nothing else that is inheritable in your process | `Launch` (explicit `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) |
 | die with you, even when your process is killed | `Job` with `JobLimits::kill_on_close`, joined before the child's first instruction by `Launch::spawn_in_job` |
 | run as the logged-on user, or as your service on that user's desktop | `PrimaryToken::for_session_user`, `PrimaryToken::duplicate_current_process` + `set_session_id`, then `Launch::as_user` |
+| run with an AppContainer token and only named capabilities | `AppContainerProfile::create_or_open`, then `Launch::app_container` |
 | be reachable only by the principals you choose | `SecurityDescriptor::from_sddl` for `PipeServer`, `NamedMutex`, `Job` and directory trees |
 | prove who is on the other end of a pipe | `PipeServer::client_process_id`, `PipeClient::server_process_id` |
 | never block you forever | every pipe operation takes a `PipeWait` deadline and can end early when the peer exits |
@@ -36,6 +37,29 @@ fn main() -> std::io::Result<()> {
     let text = read_to_end_bounded(&output, 64 * 1024)?;
     child.wait(Some(Duration::from_secs(10)))?;
     println!("{}", String::from_utf8_lossy(&text));
+    Ok(())
+}
+```
+
+An AppContainer starts with no optional capabilities. Name only the Windows
+capabilities the child needs; unknown names fail profile setup rather than
+silently launching a weaker configuration:
+
+```no_run
+#[cfg(windows)]
+fn launch_in_app_container() -> std::io::Result<()> {
+    use win_custody::{AppContainerProfile, Job, JobLimits, Launch};
+
+    let profile = AppContainerProfile::create_or_open(
+        "example.tool",
+        "Example tool",
+        "Isolated Example tool process",
+    )?;
+    let job = Job::create(&JobLimits::new().kill_on_close(true))?;
+    let child = Launch::new(r"C:\Windows\System32\whoami.exe")
+        .app_container(&profile)
+        .spawn_in_job(&job)?;
+    drop(child);
     Ok(())
 }
 ```
