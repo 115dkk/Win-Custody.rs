@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- `AppContainerProfile` creates or opens a profile with an explicit set of
+  capability SIDs, and `Launch::app_container` starts children with that token
+  while preserving explicit handle inheritance and suspended Job assignment.
+- `Process::is_app_container` reports whether a child has an AppContainer token.
+
 All notable changes to this crate are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate
 follows [Semantic Versioning](https://semver.org/).
