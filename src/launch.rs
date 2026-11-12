@@ -888,18 +888,191 @@ fn append_argument(line: &mut Vec<u16>, argument: &OsStr) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
+    use std::ffi::{c_void, OsString};
+    use std::mem::size_of;
     use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::{AsRawHandle, OwnedHandle};
     use std::path::Path;
+    use std::ptr::{null_mut, NonNull};
     use std::time::Duration;
 
+    use windows_sys::Win32::Foundation::{
+        LocalFree, ERROR_INSUFFICIENT_BUFFER, GENERIC_READ, GENERIC_WRITE,
+    };
+    use windows_sys::Win32::Globalization::lstrlenW;
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenCapabilities, TOKEN_GROUPS, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::OpenProcessToken;
+
     use super::{anonymous_pipe, command_line, command_line_tail, read_to_end_bounded, Launch};
-    use crate::handle::WaitOutcome;
+    use crate::handle::{owned_from_creation, WaitOutcome};
     use crate::job::{Job, JobLimits};
+    use crate::pipe::{PipeDirection, PipeServer, PipeWait};
+    use crate::security::{current_user_sid_string, SecurityDescriptor};
+    use crate::{AppContainerAccess, AppContainerProfile, PrimaryToken};
 
     fn cmd() -> std::path::PathBuf {
         let root = std::env::var_os("SystemRoot").expect("SystemRoot is set");
         Path::new(&root).join("System32").join("cmd.exe")
+    }
+
+    struct ProfileGuard(Option<AppContainerProfile>);
+
+    impl ProfileGuard {
+        fn new(suffix: &str) -> Self {
+            let name = format!("win-custody-test-{}-{suffix}", std::process::id());
+            assert!(name.encode_utf16().count() <= 64);
+            Self(Some(
+                AppContainerProfile::create_or_open(
+                    &name,
+                    "Win Custody test",
+                    "Win Custody AppContainer launch test",
+                )
+                .unwrap(),
+            ))
+        }
+
+        fn with_capabilities(suffix: &str, capabilities: &[&str]) -> Self {
+            let name = format!("win-custody-test-{}-{suffix}", std::process::id());
+            assert!(name.encode_utf16().count() <= 64);
+            Self(Some(
+                AppContainerProfile::create_or_open_with_capabilities(
+                    &name,
+                    "Win Custody test",
+                    "Win Custody AppContainer launch test",
+                    capabilities,
+                )
+                .unwrap(),
+            ))
+        }
+
+        fn profile(&self) -> &AppContainerProfile {
+            self.0.as_ref().expect("profile present until guard drop")
+        }
+    }
+
+    impl Drop for ProfileGuard {
+        fn drop(&mut self) {
+            if let Some(profile) = self.0.take() {
+                let _ = profile.delete();
+            }
+        }
+    }
+
+    fn token_capability_sids(process: &crate::Process) -> std::io::Result<Vec<String>> {
+        let mut raw_token = null_mut();
+        // SAFETY: the child process handle is live and `raw_token` is a local
+        // output whose returned handle is immediately wrapped as owned.
+        if unsafe { OpenProcessToken(process.as_raw_handle(), TOKEN_QUERY, &mut raw_token) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let token: OwnedHandle = owned_from_creation(raw_token)?;
+        let mut needed = 0_u32;
+        // SAFETY: this is the documented null-buffer sizing probe and `needed`
+        // is a live output pointer.
+        let probed = unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenCapabilities,
+                null_mut(),
+                0,
+                &mut needed,
+            )
+        };
+        if probed != 0
+            || std::io::Error::last_os_error().raw_os_error()
+                != Some(ERROR_INSUFFICIENT_BUFFER as i32)
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if needed < size_of::<TOKEN_GROUPS>() as u32 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "TokenCapabilities buffer is shorter than TOKEN_GROUPS",
+            ));
+        }
+        let words = (needed as usize).div_ceil(size_of::<usize>());
+        let mut storage = vec![0_usize; words];
+        let capacity = storage.len() * size_of::<usize>();
+        // SAFETY: `storage` is word-aligned and writable for at least `needed`
+        // bytes; the token and output length are live for this call.
+        if unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenCapabilities,
+                storage.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let groups = storage.as_ptr().cast::<TOKEN_GROUPS>();
+        // SAFETY: the successful call initialized a TOKEN_GROUPS header in the
+        // validated, aligned buffer.
+        let count = unsafe { (*groups).GroupCount as usize };
+        let groups_offset = std::mem::offset_of!(TOKEN_GROUPS, Groups);
+        let groups_bytes = count
+            .checked_mul(size_of::<windows_sys::Win32::Security::SID_AND_ATTRIBUTES>())
+            .and_then(|bytes| groups_offset.checked_add(bytes))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "TokenCapabilities group count overflows",
+                )
+            })?;
+        if groups_bytes > needed as usize || needed as usize > capacity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "TokenCapabilities group array exceeds its buffer",
+            ));
+        }
+        // SAFETY: `groups_offset` lies within the validated token information
+        // buffer, so advancing to the Groups member stays in its allocation.
+        let entries_pointer = unsafe { storage.as_ptr().cast::<u8>().add(groups_offset) };
+        // SAFETY: the validated byte range contains `count` contiguous entries
+        // beginning at `entries_pointer`.
+        let entries: &[windows_sys::Win32::Security::SID_AND_ATTRIBUTES] =
+            unsafe { std::slice::from_raw_parts(entries_pointer.cast(), count) };
+        entries
+            .iter()
+            .map(|entry| sid_to_string(entry.Sid))
+            .collect()
+    }
+
+    fn sid_to_string(sid: *mut c_void) -> std::io::Result<String> {
+        if NonNull::new(sid).is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "token capability has a null SID",
+            ));
+        }
+        let mut text = null_mut();
+        // SAFETY: the SID comes from a validated live token information buffer;
+        // `text` is a local output receiving a LocalAlloc string.
+        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 || text.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the converter returned a live NUL-terminated UTF-16 string.
+        let length = unsafe { lstrlenW(text) };
+        if length < 0 {
+            // SAFETY: the string was allocated by ConvertSidToStringSidW.
+            unsafe { LocalFree(text.cast()) };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "capability SID string length is invalid",
+            ));
+        }
+        // SAFETY: `length` counts initialized units before the terminating NUL.
+        let units = unsafe { std::slice::from_raw_parts(text, length as usize) };
+        let result = String::from_utf16(units)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+        // SAFETY: the string was allocated by ConvertSidToStringSidW.
+        unsafe { LocalFree(text.cast()) };
+        result
     }
 
     fn rendered(arguments: &[&str]) -> String {
@@ -964,17 +1137,15 @@ mod tests {
 
     #[test]
     fn an_appcontainer_child_is_assigned_before_resume_and_keeps_captured_stdio() {
-        use crate::AppContainerAccess;
-
-        let profile = crate::AppContainerProfile::create_or_open(
-            &format!("win-custody-test-{}", std::process::id()),
-            "Win Custody test",
-            "Win Custody AppContainer launch test",
-        )
-        .unwrap();
-        assert!(profile.sid_string().unwrap().starts_with("S-1-15-2-"));
+        let profile = ProfileGuard::new("grant");
+        assert!(profile
+            .profile()
+            .sid_string()
+            .unwrap()
+            .starts_with("S-1-15-2-"));
         let directory = tempfile::tempdir().unwrap();
         profile
+            .profile()
             .grant_path(directory.path(), AppContainerAccess::ReadWrite)
             .unwrap();
         let job = Job::create(&JobLimits::new().kill_on_close(true).active_processes(1)).unwrap();
@@ -986,7 +1157,7 @@ mod tests {
                 "echo appcontainer-ok > marker.txt & type marker.txt",
             ])
             .current_dir(directory.path())
-            .app_container(&profile)
+            .app_container(profile.profile())
             .stdout(&write)
             .spawn_in_job(&job)
             .unwrap();
@@ -1004,6 +1175,130 @@ mod tests {
                 .trim(),
             "appcontainer-ok"
         );
+    }
+
+    #[test]
+    fn an_appcontainer_child_cannot_write_outside_a_granted_directory() {
+        let profile = ProfileGuard::new("confine");
+        let granted = tempfile::tempdir().unwrap();
+        let ungranted = tempfile::tempdir().unwrap();
+        profile
+            .profile()
+            .grant_path(granted.path(), AppContainerAccess::ReadWrite)
+            .unwrap();
+        let marker = ungranted.path().join("forbidden-marker.txt");
+        assert_eq!(granted.path().parent(), ungranted.path().parent());
+        let ungranted_name = ungranted
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("tempfile directory names are Unicode");
+        assert!(!ungranted_name.chars().any(char::is_whitespace));
+        let command = format!(r"echo x > ..\{ungranted_name}\forbidden-marker.txt");
+
+        let control = Launch::new(cmd())
+            .args(["/d", "/c", &command])
+            .current_dir(granted.path())
+            .spawn()
+            .unwrap();
+        assert_eq!(
+            control.wait(Some(Duration::from_secs(30))).unwrap(),
+            WaitOutcome::Signaled
+        );
+        assert_eq!(control.exit_code().unwrap(), Some(0));
+        assert!(marker.exists());
+        std::fs::remove_file(&marker).unwrap();
+
+        // The first marker proves cmd ran inside the container, so a failure to
+        // start cannot pass for confinement.
+        let contained_command = format!("echo ok > ran-marker.txt & {command}");
+        let child = Launch::new(cmd())
+            .args(["/d", "/c", &contained_command])
+            .current_dir(granted.path())
+            .app_container(profile.profile())
+            .spawn()
+            .unwrap();
+        assert_eq!(
+            child.wait(Some(Duration::from_secs(30))).unwrap(),
+            WaitOutcome::Signaled
+        );
+        assert!(granted.path().join("ran-marker.txt").exists());
+        assert_ne!(child.exit_code().unwrap(), Some(0));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn an_appcontainer_child_token_contains_its_configured_capability() {
+        let profile = ProfileGuard::with_capabilities("capability", &["internetClient"]);
+        let child = Launch::new(cmd())
+            .args(["/d", "/c", "exit 0"])
+            .app_container(profile.profile())
+            .spawn_suspended()
+            .unwrap();
+        let capabilities = token_capability_sids(child.process()).unwrap();
+        assert!(capabilities.iter().any(|sid| sid == "S-1-15-3-1"));
+        child.process().terminate(0).unwrap();
+        assert_eq!(
+            child.process().wait(Some(Duration::from_secs(30))).unwrap(),
+            WaitOutcome::Signaled
+        );
+    }
+
+    #[test]
+    fn as_user_and_appcontainer_are_rejected_before_launch_conversion() {
+        let profile = ProfileGuard::new("as-user");
+        let token = PrimaryToken::duplicate_current_process().unwrap();
+        let error = Launch::new(Path::new("contains\0nul.exe"))
+            .as_user(&token)
+            .app_container(profile.profile())
+            .spawn()
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "an AppContainer launch cannot use as_user: the profile belongs to the calling user, not the token's user"
+        );
+    }
+
+    #[test]
+    fn appcontainer_launch_composes_with_a_low_integrity_named_pipe() {
+        let profile = ProfileGuard::new("pipe");
+        let pipe_name = format!(r"\\.\pipe\win-custody-appcontainer-{}", std::process::id());
+        let descriptor = SecurityDescriptor::from_sddl(&format!(
+            "D:P(A;;0x{:08X};;;{})(A;;0x{:08X};;;{})S:(ML;;NW;;;LW)",
+            GENERIC_READ | GENERIC_WRITE,
+            current_user_sid_string().unwrap(),
+            GENERIC_READ | GENERIC_WRITE,
+            profile.profile().sid_string().unwrap(),
+        ))
+        .unwrap();
+        let server = PipeServer::create(&pipe_name, PipeDirection::Inbound, &descriptor).unwrap();
+        let command = format!("echo appcontainer-pipe>{pipe_name}");
+        let child = Launch::new(cmd())
+            .args(["/d", "/c", &command])
+            .app_container(profile.profile())
+            .spawn()
+            .unwrap();
+        server
+            .connect(&PipeWait::within(Duration::from_secs(30)).with_peer(&child))
+            .unwrap();
+        assert_eq!(server.client_process_id().unwrap(), child.pid().unwrap());
+        let mut payload = [0_u8; 128];
+        let read = server
+            .read(
+                &mut payload,
+                &PipeWait::within(Duration::from_secs(30)).with_peer(&child),
+            )
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&payload[..read]).trim(),
+            "appcontainer-pipe"
+        );
+        assert_eq!(
+            child.wait(Some(Duration::from_secs(30))).unwrap(),
+            WaitOutcome::Signaled
+        );
+        assert_eq!(child.exit_code().unwrap(), Some(0));
     }
 
     #[test]
