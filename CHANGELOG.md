@@ -4,6 +4,22 @@ All notable changes to this crate are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate
 follows [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- `AppContainerProfile`: creates or opens a named AppContainer profile with
+  the capabilities you name, reports whether it was created
+  (`was_created`), grants it access to files and directories (`grant_path`)
+  and deletes it (`delete`). Contributed by @senamakel in #5.
+- `Launch::app_container`: starts the child in that profile's AppContainer,
+  together with the explicit handle list and the suspended create, job
+  assignment and resume order of `spawn_in_job`. AppContainer launches are
+  opt-in; a `Launch` without it confines nothing, as before. It cannot be
+  combined with `Launch::as_user`.
+- `Process::is_app_container`: whether a process runs with an AppContainer
+  token.
+
 ## 0.1.2 - 2026-10-29
 
 ### Added

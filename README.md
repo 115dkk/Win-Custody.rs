@@ -13,6 +13,7 @@ owned types.
 | inherit exactly the handles you name, nothing else that is inheritable in your process | `Launch` (explicit `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) |
 | die with you, even when your process is killed | `Job` with `JobLimits::kill_on_close`, joined before the child's first instruction by `Launch::spawn_in_job` |
 | run as the logged-on user, or as your service on that user's desktop | `PrimaryToken::for_session_user`, `PrimaryToken::duplicate_current_process` + `set_session_id`, then `Launch::as_user` |
+| run in an AppContainer, with only the capabilities and paths you grant (opt-in) | `AppContainerProfile::create_or_open`, `grant_path`, then `Launch::app_container` |
 | be reachable only by the principals you choose | `SecurityDescriptor::from_sddl` for `PipeServer`, `NamedMutex`, `Job` and directory trees |
 | prove who is on the other end of a pipe | `PipeServer::client_process_id`, `PipeClient::server_process_id` |
 | never block you forever | every pipe operation takes a `PipeWait` deadline and can end early when the peer exits |
@@ -40,6 +41,32 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
+Only a `Launch` given `.app_container(...)` runs confined. The child then has
+the capabilities you name, the paths you grant with `grant_path`, and what
+Windows grants every AppContainer process through `ALL APPLICATION PACKAGES`
+(`S-1-15-2-1`), which includes reading and executing the Windows and Program
+Files directories. Windows does not check capability names, so a misspelled
+name is accepted and the child runs without that capability:
+
+```no_run
+#[cfg(windows)]
+fn launch_in_app_container() -> std::io::Result<()> {
+    use win_custody::{AppContainerProfile, Job, JobLimits, Launch};
+
+    let profile = AppContainerProfile::create_or_open(
+        "example.tool",
+        "Example tool",
+        "Isolated Example tool process",
+    )?;
+    let job = Job::create(&JobLimits::new().kill_on_close(true))?;
+    let child = Launch::new(r"C:\Windows\System32\whoami.exe")
+        .app_container(&profile)
+        .spawn_in_job(&job)?;
+    drop(child);
+    Ok(())
+}
+```
+
 Passing an extra handle to a child is one call; the return value is the
 handle number the child will see:
 
@@ -56,12 +83,26 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
-## Not a sandbox
+## Sandboxing is opt-in
 
-Nothing here limits what a child can do with the rights its token already
-has. A job object ties the child's lifetime and resource use to yours; it does
-not stop the child from reading files, writing the registry or opening network
-connections. To run code you do not trust, use an AppContainer or a separate
+A `Launch` without `app_container` confines nothing. It does not limit what a
+child can do with the rights its token already has: a job object ties the
+child's lifetime and resource use to yours, but does not stop the child from
+reading files, writing the registry or opening network connections.
+
+`Launch::app_container` runs the child in an AppContainer instead. Know what
+that is before relying on it:
+
+- It is a plain AppContainer, not a Less Privileged AppContainer (LPAC), so
+  everything granted to `ALL APPLICATION PACKAGES` stays reachable.
+- It cannot be combined with `Launch::as_user`: the profile belongs to the
+  calling user, not to the token's user, and the launch fails with
+  `InvalidInput`.
+- `AppContainerProfile::grant_path` writes the grant into the files' ACLs. On
+  a directory it reaches everything already under it, and it stays after the
+  process exits and after the profile is deleted.
+
+For code that needs stronger isolation than that, use a separate
 low-privilege account.
 
 ## How it relates to other crates

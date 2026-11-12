@@ -14,10 +14,15 @@ The crate's own code, including:
 - a security descriptor, pipe, or mutex that admits principals the caller's
   SDDL did not grant, or a peer identity check that reports the wrong
   process;
-- a pipe operation that blocks past its `PipeWait` deadline.
+- a pipe operation that blocks past its `PipeWait` deadline;
+- with `Launch::app_container`: a child that does not run in the requested
+  AppContainer, holds a capability that was not requested, or gets more
+  access from `AppContainerProfile::grant_path` than was asked for.
 
-`win-custody` is not a sandbox. Code that a child runs with the rights it was
-given is not a vulnerability in this crate.
+Sandboxing is opt-in. A `Launch` without `app_container` confines nothing, so
+code that a child runs with the rights it was given is not a vulnerability in
+this crate. Escaping an AppContainer that was set up as requested is a Windows
+issue, not this crate's.
 
 ## Supported versions
 

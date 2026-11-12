@@ -4,6 +4,7 @@
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::marker::PhantomData;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, OwnedHandle, RawHandle};
@@ -18,6 +19,7 @@ use windows_sys::Win32::Globalization::{
     CompareStringOrdinal, CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Security::SECURITY_CAPABILITIES;
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -28,9 +30,11 @@ use windows_sys::Win32::System::Threading::{
     InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
     LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    STARTUPINFOW,
 };
 
+use crate::app_container::AppContainerProfile;
 use crate::handle::{current_process, owned_from_creation};
 use crate::job::Job;
 use crate::process::{Process, ProcessAccess};
@@ -82,6 +86,7 @@ pub struct Launch<'a> {
     extra_flags: u32,
     token: Option<&'a PrimaryToken>,
     desktop: Option<OsString>,
+    app_container: Option<&'a AppContainerProfile>,
 }
 
 impl<'a> Launch<'a> {
@@ -101,6 +106,7 @@ impl<'a> Launch<'a> {
             extra_flags: 0,
             token: None,
             desktop: None,
+            app_container: None,
         }
     }
 
@@ -214,7 +220,9 @@ impl<'a> Launch<'a> {
     /// own; services running as LocalSystem hold both. Windows does not let a
     /// child in another session inherit handles, so a launch into another
     /// session must not set standard handles or call
-    /// [`inherit`](Self::inherit).
+    /// [`inherit`](Self::inherit). This cannot be combined with
+    /// [`app_container`](Self::app_container); the `spawn_*` methods fail with
+    /// [`io::ErrorKind::InvalidInput`] when both are configured.
     pub fn as_user(&mut self, token: &'a PrimaryToken) -> &mut Self {
         self.token = Some(token);
         self
@@ -227,9 +235,26 @@ impl<'a> Launch<'a> {
         self
     }
 
+    /// Creates the child in `profile`'s AppContainer with exactly its
+    /// configured capabilities. This attribute is combined with the explicit
+    /// inherited-handle list when both are present. This cannot be combined
+    /// with [`as_user`](Self::as_user); the `spawn_*` methods fail with
+    /// [`io::ErrorKind::InvalidInput`] when both are configured.
+    pub fn app_container(&mut self, profile: &'a AppContainerProfile) -> &mut Self {
+        self.app_container = Some(profile);
+        self
+    }
+
     /// Creates the child suspended. Nothing in it runs until
     /// [`SuspendedChild::resume`].
     pub fn spawn_suspended(&mut self) -> io::Result<SuspendedChild> {
+        if self.token.is_some() && self.app_container.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an AppContainer launch cannot use as_user: the profile belongs to the calling user, not the token's user",
+            ));
+        }
+
         let application = wide_null(&self.executable)?;
         let mut command_line = command_line(&self.executable, &self.arguments)?;
         let current_dir = self.current_dir.as_ref().map(wide_null).transpose()?;
@@ -260,10 +285,13 @@ impl<'a> Launch<'a> {
             }
         }
 
-        let mut attributes = if handles.is_empty() {
+        let mut attributes = if handles.is_empty() && self.app_container.is_none() {
             None
         } else {
-            Some(AttributeList::with_handles(&handles)?)
+            Some(AttributeList::with_attributes(
+                &handles,
+                self.app_container,
+            )?)
         };
         let inheritable = InheritableWindow::open(&self.inherited)?;
 
@@ -308,7 +336,9 @@ impl<'a> Launch<'a> {
             // CREATE_UNICODE_ENVIRONMENT; `startup` carries live standard
             // handles and, when present, an initialized attribute list whose
             // handles are all inheritable for this call; `information` is a
-            // local out structure.
+            // local out structure. The attribute list owns its handle array and
+            // boxed security-capabilities value, whose profile borrow keeps all
+            // referenced SIDs live through process creation.
             None => unsafe {
                 CreateProcessW(
                     application.as_ptr(),
@@ -323,8 +353,9 @@ impl<'a> Launch<'a> {
                     &mut information,
                 )
             },
-            // SAFETY: as above; the token is a live primary token borrowed for
-            // the lifetime of this launch.
+            // SAFETY: as above, including attribute-list ownership of handles
+            // and any boxed security capabilities and their borrowed profile;
+            // the token is a live primary token borrowed for this launch.
             Some(token) => unsafe {
                 CreateProcessAsUserW(
                     token.as_raw_handle(),
@@ -583,21 +614,31 @@ fn set_inheritable(handle: RawHandle, inheritable: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// A `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` attribute list. The storage is
-/// allocated to the size the OS reports and deleted when dropped.
-struct AttributeList {
+/// A process-thread attribute list owning every value to which its handle-list
+/// and security-capabilities attributes point. Storage is allocated to the size
+/// Windows reports and the initialized list is deleted when dropped.
+struct AttributeList<'a> {
     storage: Vec<usize>,
     initialized: bool,
     /// The list stores a pointer to the handle array, so the array lives here.
     _handles: Vec<HANDLE>,
+    /// Boxed so the security-capabilities attribute points to a stable address.
+    _security_capabilities: Option<Box<SECURITY_CAPABILITIES>>,
+    /// Keeps the profile and every SID referenced by the boxed value alive.
+    _profile: PhantomData<&'a AppContainerProfile>,
 }
 
-impl AttributeList {
-    fn with_handles(handles: &[HANDLE]) -> io::Result<Self> {
+impl<'a> AttributeList<'a> {
+    fn with_attributes(
+        handles: &[HANDLE],
+        app_container: Option<&'a AppContainerProfile>,
+    ) -> io::Result<Self> {
+        let mut count = u32::from(!handles.is_empty());
+        count += u32::from(app_container.is_some());
         let mut bytes = 0_usize;
         // SAFETY: a null list with a size probe is the documented way to ask
         // for the required byte count; the out pointer is a local.
-        unsafe { InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut bytes) };
+        unsafe { InitializeProcThreadAttributeList(null_mut(), count, 0, &mut bytes) };
         if bytes == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -605,33 +646,61 @@ impl AttributeList {
             storage: vec![0_usize; bytes.div_ceil(size_of::<usize>())],
             initialized: false,
             _handles: handles.to_vec(),
+            _security_capabilities: app_container
+                .map(AppContainerProfile::security_capabilities)
+                .map(Box::new),
+            _profile: PhantomData,
         };
         // SAFETY: `storage` is at least `bytes` long and word-aligned, and the
         // list is deleted in `Drop` only after this initialization succeeds.
         let initialized =
-            unsafe { InitializeProcThreadAttributeList(list.as_mut_ptr(), 1, 0, &mut bytes) };
+            unsafe { InitializeProcThreadAttributeList(list.as_mut_ptr(), count, 0, &mut bytes) };
         if initialized == 0 {
             return Err(io::Error::last_os_error());
         }
         list.initialized = true;
-        let pointer = list._handles.as_ptr();
-        let length = std::mem::size_of_val(list._handles.as_slice());
-        // SAFETY: the list is initialized; the handle array is owned by the
-        // list, does not move while the list lives, and its byte length is
-        // passed alongside its pointer.
-        let updated = unsafe {
-            UpdateProcThreadAttribute(
-                list.as_mut_ptr(),
-                0,
-                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                pointer.cast(),
-                length,
-                null_mut(),
-                null(),
-            )
-        };
-        if updated == 0 {
-            return Err(io::Error::last_os_error());
+        if !list._handles.is_empty() {
+            let pointer = list._handles.as_ptr();
+            let length = std::mem::size_of_val(list._handles.as_slice());
+            // SAFETY: the list is initialized; the handle array is owned by
+            // the list and stays in the same allocation for this call.
+            let updated = unsafe {
+                UpdateProcThreadAttribute(
+                    list.as_mut_ptr(),
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                    pointer.cast(),
+                    length,
+                    null_mut(),
+                    null(),
+                )
+            };
+            if updated == 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        let capabilities = list
+            ._security_capabilities
+            .as_deref_mut()
+            .map(|value| value as *mut SECURITY_CAPABILITIES);
+        if let Some(capabilities) = capabilities {
+            // SAFETY: the initialized list points to the boxed value owned by
+            // `list`; its profile borrow keeps every referenced SID and SID
+            // array live until after CreateProcess and attribute-list deletion.
+            let updated = unsafe {
+                UpdateProcThreadAttribute(
+                    list.as_mut_ptr(),
+                    0,
+                    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                    capabilities.cast(),
+                    size_of::<SECURITY_CAPABILITIES>(),
+                    null_mut(),
+                    null(),
+                )
+            };
+            if updated == 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
         Ok(list)
     }
@@ -641,11 +710,12 @@ impl AttributeList {
     }
 }
 
-impl Drop for AttributeList {
+impl Drop for AttributeList<'_> {
     fn drop(&mut self) {
         if self.initialized {
-            // SAFETY: the list was initialized in `with_handles` and has not
-            // been deleted since.
+            // SAFETY: the list was initialized in `with_attributes`, has not
+            // been deleted, and all pointed-to handle and security-capabilities
+            // storage remains owned by `self` until this drop completes.
             unsafe { DeleteProcThreadAttributeList(self.as_mut_ptr()) };
         }
     }
@@ -818,18 +888,191 @@ fn append_argument(line: &mut Vec<u16>, argument: &OsStr) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
+    use std::ffi::{c_void, OsString};
+    use std::mem::size_of;
     use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::{AsRawHandle, OwnedHandle};
     use std::path::Path;
+    use std::ptr::{null_mut, NonNull};
     use std::time::Duration;
 
+    use windows_sys::Win32::Foundation::{
+        LocalFree, ERROR_INSUFFICIENT_BUFFER, GENERIC_READ, GENERIC_WRITE,
+    };
+    use windows_sys::Win32::Globalization::lstrlenW;
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenCapabilities, TOKEN_GROUPS, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::OpenProcessToken;
+
     use super::{anonymous_pipe, command_line, command_line_tail, read_to_end_bounded, Launch};
-    use crate::handle::WaitOutcome;
+    use crate::handle::{owned_from_creation, WaitOutcome};
     use crate::job::{Job, JobLimits};
+    use crate::pipe::{PipeDirection, PipeServer, PipeWait};
+    use crate::security::{current_user_sid_string, SecurityDescriptor};
+    use crate::{AppContainerAccess, AppContainerProfile, PrimaryToken};
 
     fn cmd() -> std::path::PathBuf {
         let root = std::env::var_os("SystemRoot").expect("SystemRoot is set");
         Path::new(&root).join("System32").join("cmd.exe")
+    }
+
+    struct ProfileGuard(Option<AppContainerProfile>);
+
+    impl ProfileGuard {
+        fn new(suffix: &str) -> Self {
+            let name = format!("win-custody-test-{}-{suffix}", std::process::id());
+            assert!(name.encode_utf16().count() <= 64);
+            Self(Some(
+                AppContainerProfile::create_or_open(
+                    &name,
+                    "Win Custody test",
+                    "Win Custody AppContainer launch test",
+                )
+                .unwrap(),
+            ))
+        }
+
+        fn with_capabilities(suffix: &str, capabilities: &[&str]) -> Self {
+            let name = format!("win-custody-test-{}-{suffix}", std::process::id());
+            assert!(name.encode_utf16().count() <= 64);
+            Self(Some(
+                AppContainerProfile::create_or_open_with_capabilities(
+                    &name,
+                    "Win Custody test",
+                    "Win Custody AppContainer launch test",
+                    capabilities,
+                )
+                .unwrap(),
+            ))
+        }
+
+        fn profile(&self) -> &AppContainerProfile {
+            self.0.as_ref().expect("profile present until guard drop")
+        }
+    }
+
+    impl Drop for ProfileGuard {
+        fn drop(&mut self) {
+            if let Some(profile) = self.0.take() {
+                let _ = profile.delete();
+            }
+        }
+    }
+
+    fn token_capability_sids(process: &crate::Process) -> std::io::Result<Vec<String>> {
+        let mut raw_token = null_mut();
+        // SAFETY: the child process handle is live and `raw_token` is a local
+        // output whose returned handle is immediately wrapped as owned.
+        if unsafe { OpenProcessToken(process.as_raw_handle(), TOKEN_QUERY, &mut raw_token) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let token: OwnedHandle = owned_from_creation(raw_token)?;
+        let mut needed = 0_u32;
+        // SAFETY: this is the documented null-buffer sizing probe and `needed`
+        // is a live output pointer.
+        let probed = unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenCapabilities,
+                null_mut(),
+                0,
+                &mut needed,
+            )
+        };
+        if probed != 0
+            || std::io::Error::last_os_error().raw_os_error()
+                != Some(ERROR_INSUFFICIENT_BUFFER as i32)
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if needed < size_of::<TOKEN_GROUPS>() as u32 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "TokenCapabilities buffer is shorter than TOKEN_GROUPS",
+            ));
+        }
+        let words = (needed as usize).div_ceil(size_of::<usize>());
+        let mut storage = vec![0_usize; words];
+        let capacity = storage.len() * size_of::<usize>();
+        // SAFETY: `storage` is word-aligned and writable for at least `needed`
+        // bytes; the token and output length are live for this call.
+        if unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenCapabilities,
+                storage.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let groups = storage.as_ptr().cast::<TOKEN_GROUPS>();
+        // SAFETY: the successful call initialized a TOKEN_GROUPS header in the
+        // validated, aligned buffer.
+        let count = unsafe { (*groups).GroupCount as usize };
+        let groups_offset = std::mem::offset_of!(TOKEN_GROUPS, Groups);
+        let groups_bytes = count
+            .checked_mul(size_of::<windows_sys::Win32::Security::SID_AND_ATTRIBUTES>())
+            .and_then(|bytes| groups_offset.checked_add(bytes))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "TokenCapabilities group count overflows",
+                )
+            })?;
+        if groups_bytes > needed as usize || needed as usize > capacity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "TokenCapabilities group array exceeds its buffer",
+            ));
+        }
+        // SAFETY: `groups_offset` lies within the validated token information
+        // buffer, so advancing to the Groups member stays in its allocation.
+        let entries_pointer = unsafe { storage.as_ptr().cast::<u8>().add(groups_offset) };
+        // SAFETY: the validated byte range contains `count` contiguous entries
+        // beginning at `entries_pointer`.
+        let entries: &[windows_sys::Win32::Security::SID_AND_ATTRIBUTES] =
+            unsafe { std::slice::from_raw_parts(entries_pointer.cast(), count) };
+        entries
+            .iter()
+            .map(|entry| sid_to_string(entry.Sid))
+            .collect()
+    }
+
+    fn sid_to_string(sid: *mut c_void) -> std::io::Result<String> {
+        if NonNull::new(sid).is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "token capability has a null SID",
+            ));
+        }
+        let mut text = null_mut();
+        // SAFETY: the SID comes from a validated live token information buffer;
+        // `text` is a local output receiving a LocalAlloc string.
+        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 || text.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the converter returned a live NUL-terminated UTF-16 string.
+        let length = unsafe { lstrlenW(text) };
+        if length < 0 {
+            // SAFETY: the string was allocated by ConvertSidToStringSidW.
+            unsafe { LocalFree(text.cast()) };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "capability SID string length is invalid",
+            ));
+        }
+        // SAFETY: `length` counts initialized units before the terminating NUL.
+        let units = unsafe { std::slice::from_raw_parts(text, length as usize) };
+        let result = String::from_utf16(units)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+        // SAFETY: the string was allocated by ConvertSidToStringSidW.
+        unsafe { LocalFree(text.cast()) };
+        result
     }
 
     fn rendered(arguments: &[&str]) -> String {
@@ -890,6 +1133,172 @@ mod tests {
             WaitOutcome::Signaled
         );
         assert_eq!(child.exit_code().unwrap(), Some(7));
+    }
+
+    #[test]
+    fn an_appcontainer_child_is_assigned_before_resume_and_keeps_captured_stdio() {
+        let profile = ProfileGuard::new("grant");
+        assert!(profile
+            .profile()
+            .sid_string()
+            .unwrap()
+            .starts_with("S-1-15-2-"));
+        let directory = tempfile::tempdir().unwrap();
+        profile
+            .profile()
+            .grant_path(directory.path(), AppContainerAccess::ReadWrite)
+            .unwrap();
+        let job = Job::create(&JobLimits::new().kill_on_close(true).active_processes(1)).unwrap();
+        let (read, write) = anonymous_pipe().unwrap();
+        let child = Launch::new(cmd())
+            .args([
+                "/d",
+                "/c",
+                "echo appcontainer-ok > marker.txt & type marker.txt",
+            ])
+            .current_dir(directory.path())
+            .app_container(profile.profile())
+            .stdout(&write)
+            .spawn_in_job(&job)
+            .unwrap();
+        assert!(child.is_app_container().unwrap());
+        drop(write);
+        let output = read_to_end_bounded(&read, 4096).unwrap();
+        assert_eq!(
+            child.wait(Some(Duration::from_secs(30))).unwrap(),
+            WaitOutcome::Signaled
+        );
+        assert_eq!(String::from_utf8_lossy(&output).trim(), "appcontainer-ok");
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("marker.txt"))
+                .unwrap()
+                .trim(),
+            "appcontainer-ok"
+        );
+    }
+
+    #[test]
+    fn an_appcontainer_child_cannot_write_outside_a_granted_directory() {
+        let profile = ProfileGuard::new("confine");
+        let granted = tempfile::tempdir().unwrap();
+        let ungranted = tempfile::tempdir().unwrap();
+        profile
+            .profile()
+            .grant_path(granted.path(), AppContainerAccess::ReadWrite)
+            .unwrap();
+        let marker = ungranted.path().join("forbidden-marker.txt");
+        assert_eq!(granted.path().parent(), ungranted.path().parent());
+        let ungranted_name = ungranted
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("tempfile directory names are Unicode");
+        assert!(!ungranted_name.chars().any(char::is_whitespace));
+        let command = format!(r"echo x > ..\{ungranted_name}\forbidden-marker.txt");
+
+        let control = Launch::new(cmd())
+            .args(["/d", "/c", &command])
+            .current_dir(granted.path())
+            .spawn()
+            .unwrap();
+        assert_eq!(
+            control.wait(Some(Duration::from_secs(30))).unwrap(),
+            WaitOutcome::Signaled
+        );
+        assert_eq!(control.exit_code().unwrap(), Some(0));
+        assert!(marker.exists());
+        std::fs::remove_file(&marker).unwrap();
+
+        // The first marker proves cmd ran inside the container, so a failure to
+        // start cannot pass for confinement.
+        let contained_command = format!("echo ok > ran-marker.txt & {command}");
+        let child = Launch::new(cmd())
+            .args(["/d", "/c", &contained_command])
+            .current_dir(granted.path())
+            .app_container(profile.profile())
+            .spawn()
+            .unwrap();
+        assert_eq!(
+            child.wait(Some(Duration::from_secs(30))).unwrap(),
+            WaitOutcome::Signaled
+        );
+        assert!(granted.path().join("ran-marker.txt").exists());
+        assert_ne!(child.exit_code().unwrap(), Some(0));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn an_appcontainer_child_token_contains_its_configured_capability() {
+        let profile = ProfileGuard::with_capabilities("capability", &["internetClient"]);
+        let child = Launch::new(cmd())
+            .args(["/d", "/c", "exit 0"])
+            .app_container(profile.profile())
+            .spawn_suspended()
+            .unwrap();
+        let capabilities = token_capability_sids(child.process()).unwrap();
+        assert!(capabilities.iter().any(|sid| sid == "S-1-15-3-1"));
+        child.process().terminate(0).unwrap();
+        assert_eq!(
+            child.process().wait(Some(Duration::from_secs(30))).unwrap(),
+            WaitOutcome::Signaled
+        );
+    }
+
+    #[test]
+    fn as_user_and_appcontainer_are_rejected_before_launch_conversion() {
+        let profile = ProfileGuard::new("as-user");
+        let token = PrimaryToken::duplicate_current_process().unwrap();
+        let error = Launch::new(Path::new("contains\0nul.exe"))
+            .as_user(&token)
+            .app_container(profile.profile())
+            .spawn()
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "an AppContainer launch cannot use as_user: the profile belongs to the calling user, not the token's user"
+        );
+    }
+
+    #[test]
+    fn appcontainer_launch_composes_with_a_low_integrity_named_pipe() {
+        let profile = ProfileGuard::new("pipe");
+        let pipe_name = format!(r"\\.\pipe\win-custody-appcontainer-{}", std::process::id());
+        let descriptor = SecurityDescriptor::from_sddl(&format!(
+            "D:P(A;;0x{:08X};;;{})(A;;0x{:08X};;;{})S:(ML;;NW;;;LW)",
+            GENERIC_READ | GENERIC_WRITE,
+            current_user_sid_string().unwrap(),
+            GENERIC_READ | GENERIC_WRITE,
+            profile.profile().sid_string().unwrap(),
+        ))
+        .unwrap();
+        let server = PipeServer::create(&pipe_name, PipeDirection::Inbound, &descriptor).unwrap();
+        let command = format!("echo appcontainer-pipe>{pipe_name}");
+        let child = Launch::new(cmd())
+            .args(["/d", "/c", &command])
+            .app_container(profile.profile())
+            .spawn()
+            .unwrap();
+        server
+            .connect(&PipeWait::within(Duration::from_secs(30)).with_peer(&child))
+            .unwrap();
+        assert_eq!(server.client_process_id().unwrap(), child.pid().unwrap());
+        let mut payload = [0_u8; 128];
+        let read = server
+            .read(
+                &mut payload,
+                &PipeWait::within(Duration::from_secs(30)).with_peer(&child),
+            )
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&payload[..read]).trim(),
+            "appcontainer-pipe"
+        );
+        assert_eq!(
+            child.wait(Some(Duration::from_secs(30))).unwrap(),
+            WaitOutcome::Signaled
+        );
+        assert_eq!(child.exit_code().unwrap(), Some(0));
     }
 
     #[test]
