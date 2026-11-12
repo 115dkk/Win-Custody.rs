@@ -18,6 +18,7 @@ use windows_sys::Win32::Globalization::{
     CompareStringOrdinal, CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Security::SECURITY_CAPABILITIES;
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -28,9 +29,11 @@ use windows_sys::Win32::System::Threading::{
     InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
     LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    STARTUPINFOW,
 };
 
+use crate::app_container::AppContainerProfile;
 use crate::handle::{current_process, owned_from_creation};
 use crate::job::Job;
 use crate::process::{Process, ProcessAccess};
@@ -82,6 +85,7 @@ pub struct Launch<'a> {
     extra_flags: u32,
     token: Option<&'a PrimaryToken>,
     desktop: Option<OsString>,
+    app_container: Option<&'a AppContainerProfile>,
 }
 
 impl<'a> Launch<'a> {
@@ -101,6 +105,7 @@ impl<'a> Launch<'a> {
             extra_flags: 0,
             token: None,
             desktop: None,
+            app_container: None,
         }
     }
 
@@ -227,6 +232,14 @@ impl<'a> Launch<'a> {
         self
     }
 
+    /// Creates the child in `profile`'s AppContainer with exactly its
+    /// configured capabilities. This attribute is combined with the explicit
+    /// inherited-handle list when both are present.
+    pub fn app_container(&mut self, profile: &'a AppContainerProfile) -> &mut Self {
+        self.app_container = Some(profile);
+        self
+    }
+
     /// Creates the child suspended. Nothing in it runs until
     /// [`SuspendedChild::resume`].
     pub fn spawn_suspended(&mut self) -> io::Result<SuspendedChild> {
@@ -260,10 +273,16 @@ impl<'a> Launch<'a> {
             }
         }
 
-        let mut attributes = if handles.is_empty() {
+        let mut security_capabilities = self
+            .app_container
+            .map(AppContainerProfile::security_capabilities);
+        let mut attributes = if handles.is_empty() && security_capabilities.is_none() {
             None
         } else {
-            Some(AttributeList::with_handles(&handles)?)
+            Some(AttributeList::with_attributes(
+                &handles,
+                security_capabilities.as_mut(),
+            )?)
         };
         let inheritable = InheritableWindow::open(&self.inherited)?;
 
@@ -593,11 +612,16 @@ struct AttributeList {
 }
 
 impl AttributeList {
-    fn with_handles(handles: &[HANDLE]) -> io::Result<Self> {
+    fn with_attributes(
+        handles: &[HANDLE],
+        security_capabilities: Option<&mut SECURITY_CAPABILITIES>,
+    ) -> io::Result<Self> {
+        let mut count = u32::from(!handles.is_empty());
+        count += u32::from(security_capabilities.is_some());
         let mut bytes = 0_usize;
         // SAFETY: a null list with a size probe is the documented way to ask
         // for the required byte count; the out pointer is a local.
-        unsafe { InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut bytes) };
+        unsafe { InitializeProcThreadAttributeList(null_mut(), count, 0, &mut bytes) };
         if bytes == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -609,29 +633,50 @@ impl AttributeList {
         // SAFETY: `storage` is at least `bytes` long and word-aligned, and the
         // list is deleted in `Drop` only after this initialization succeeds.
         let initialized =
-            unsafe { InitializeProcThreadAttributeList(list.as_mut_ptr(), 1, 0, &mut bytes) };
+            unsafe { InitializeProcThreadAttributeList(list.as_mut_ptr(), count, 0, &mut bytes) };
         if initialized == 0 {
             return Err(io::Error::last_os_error());
         }
         list.initialized = true;
-        let pointer = list._handles.as_ptr();
-        let length = std::mem::size_of_val(list._handles.as_slice());
-        // SAFETY: the list is initialized; the handle array is owned by the
-        // list, does not move while the list lives, and its byte length is
-        // passed alongside its pointer.
-        let updated = unsafe {
-            UpdateProcThreadAttribute(
-                list.as_mut_ptr(),
-                0,
-                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                pointer.cast(),
-                length,
-                null_mut(),
-                null(),
-            )
-        };
-        if updated == 0 {
-            return Err(io::Error::last_os_error());
+        if !list._handles.is_empty() {
+            let pointer = list._handles.as_ptr();
+            let length = std::mem::size_of_val(list._handles.as_slice());
+            // SAFETY: the list is initialized; the handle array is owned by
+            // the list and stays in the same allocation for this call.
+            let updated = unsafe {
+                UpdateProcThreadAttribute(
+                    list.as_mut_ptr(),
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                    pointer.cast(),
+                    length,
+                    null_mut(),
+                    null(),
+                )
+            };
+            if updated == 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        if let Some(capabilities) = security_capabilities {
+            // SAFETY: the initialized list stores a pointer to this
+            // SECURITY_CAPABILITIES value only until CreateProcess returns;
+            // its referenced profile and SID array are borrowed for this
+            // entire spawn call.
+            let updated = unsafe {
+                UpdateProcThreadAttribute(
+                    list.as_mut_ptr(),
+                    0,
+                    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                    (capabilities as *mut SECURITY_CAPABILITIES).cast(),
+                    size_of::<SECURITY_CAPABILITIES>(),
+                    null_mut(),
+                    null(),
+                )
+            };
+            if updated == 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
         Ok(list)
     }
@@ -890,6 +935,50 @@ mod tests {
             WaitOutcome::Signaled
         );
         assert_eq!(child.exit_code().unwrap(), Some(7));
+    }
+
+    #[test]
+    fn an_appcontainer_child_is_assigned_before_resume_and_keeps_captured_stdio() {
+        use crate::AppContainerAccess;
+
+        let profile = crate::AppContainerProfile::create_or_open(
+            &format!("win-custody-test-{}", std::process::id()),
+            "Win Custody test",
+            "Win Custody AppContainer launch test",
+        )
+        .unwrap();
+        assert!(profile.sid_string().unwrap().starts_with("S-1-15-2-"));
+        let directory = tempfile::tempdir().unwrap();
+        profile
+            .grant_path(directory.path(), AppContainerAccess::ReadWrite)
+            .unwrap();
+        let job = Job::create(&JobLimits::new().kill_on_close(true).active_processes(1)).unwrap();
+        let (read, write) = anonymous_pipe().unwrap();
+        let child = Launch::new(cmd())
+            .args([
+                "/d",
+                "/c",
+                "echo appcontainer-ok > marker.txt & type marker.txt",
+            ])
+            .current_dir(directory.path())
+            .app_container(&profile)
+            .stdout(&write)
+            .spawn_in_job(&job)
+            .unwrap();
+        assert!(child.is_app_container().unwrap());
+        drop(write);
+        let output = read_to_end_bounded(&read, 4096).unwrap();
+        assert_eq!(
+            child.wait(Some(Duration::from_secs(30))).unwrap(),
+            WaitOutcome::Signaled
+        );
+        assert_eq!(String::from_utf8_lossy(&output).trim(), "appcontainer-ok");
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("marker.txt"))
+                .unwrap()
+                .trim(),
+            "appcontainer-ok"
+        );
     }
 
     #[test]
