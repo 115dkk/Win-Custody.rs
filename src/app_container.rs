@@ -3,44 +3,64 @@
 
 use std::ffi::OsString;
 use std::io;
-use std::mem::size_of;
 use std::os::windows::ffi::OsStringExt;
 use std::path::Path;
 use std::ptr;
 
-use windows_sys::Win32::Foundation::LocalFree;
+use windows_sys::Win32::Foundation::{LocalFree, GENERIC_READ, GENERIC_WRITE};
 use windows_sys::Win32::Globalization::lstrlenW;
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW,
     EXPLICIT_ACCESS_W, SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_GROUP, TRUSTEE_IS_SID, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
-    CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+    CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{
     DeriveCapabilitySidsFromName, FreeSid, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
     OBJECT_INHERIT_ACE, PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
 };
+use windows_sys::Win32::Storage::FileSystem::DELETE;
+use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
 
 use crate::wide::wide_null;
 
 const PROFILE_ALREADY_EXISTS: u32 = 0x8007_00b7;
-const SE_GROUP_ENABLED: u32 = 0x0000_0004;
 
 /// A named AppContainer profile and the capabilities assigned to its child
 /// processes. Profile data persists in Windows after this value is dropped.
+///
+/// A process launched in the profile still has everything Windows grants to
+/// ALL APPLICATION PACKAGES (`S-1-15-2-1`): read and execute access to the
+/// Windows and Program Files directories, and to every registry key that
+/// grants that SID access. This is a plain AppContainer, not a Less
+/// Privileged AppContainer (LPAC).
 pub struct AppContainerProfile {
     sid: AppContainerSid,
     _capabilities: Vec<DerivedCapability>,
     capability_attributes: Vec<SID_AND_ATTRIBUTES>,
+    name: Vec<u16>,
+    created: bool,
 }
+
+// SAFETY: the profile owns every SID and SID pointer array reachable through
+// its fields. They are written once during construction and only read after
+// construction, with no interior mutability, and the Windows readers have no
+// thread affinity, so ownership may move between threads.
+unsafe impl Send for AppContainerProfile {}
+// SAFETY: every owned SID and SID pointer array is immutable after
+// construction, there is no interior mutability, and Windows only reads these
+// allocations through APIs with no thread affinity, so shared access is safe.
+unsafe impl Sync for AppContainerProfile {}
 
 impl AppContainerProfile {
     /// Creates or opens a named AppContainer profile with no capabilities.
     ///
     /// With no capabilities, the profile receives no optional network or
     /// device access. The name must be unique to the application and at most
-    /// 64 UTF-16 code units, as required by Windows.
+    /// 64 UTF-16 code units, as required by Windows. Use
+    /// [`was_created`](Self::was_created) to distinguish a newly created
+    /// profile from an existing one.
     pub fn create_or_open(name: &str, display_name: &str, description: &str) -> io::Result<Self> {
         Self::create_or_open_with_capabilities(name, display_name, description, &[])
     }
@@ -48,8 +68,11 @@ impl AppContainerProfile {
     /// Creates or opens a named AppContainer profile and grants the named
     /// Windows capabilities to processes launched in it.
     ///
-    /// Every capability must resolve successfully. An unknown capability
-    /// fails the call rather than silently launching a less capable profile.
+    /// Windows does not validate capability names:
+    /// `DeriveCapabilitySidsFromName` turns any non-empty string into a SID,
+    /// so a misspelled name succeeds and the child runs without the
+    /// capability that was meant. Use the names Microsoft documents, such as
+    /// `internetClient`. An empty name is rejected.
     pub fn create_or_open_with_capabilities(
         name: &str,
         display_name: &str,
@@ -74,7 +97,7 @@ impl AppContainerProfile {
             capability_attributes.extend(derivation.capability_sids.iter().map(|sid| {
                 SID_AND_ATTRIBUTES {
                     Sid: *sid,
-                    Attributes: SE_GROUP_ENABLED,
+                    Attributes: SE_GROUP_ENABLED as u32,
                 }
             }));
         }
@@ -83,7 +106,7 @@ impl AppContainerProfile {
         // SAFETY: all UTF-16 strings and capability attributes remain live
         // across the call; `sid` is a local out pointer. Windows returns the
         // profile SID allocation owned by `AppContainerSid`.
-        let created = unsafe {
+        let result = unsafe {
             CreateAppContainerProfile(
                 name_w.as_ptr(),
                 display_w.as_ptr(),
@@ -97,17 +120,20 @@ impl AppContainerProfile {
                 &mut sid,
             )
         };
-        if created as u32 == PROFILE_ALREADY_EXISTS {
+        let created = if result as u32 == PROFILE_ALREADY_EXISTS {
             // SAFETY: the profile name is valid and NUL-terminated; `sid` is
             // a local out pointer whose allocation is freed with FreeSid.
             let derived =
                 unsafe { DeriveAppContainerSidFromAppContainerName(name_w.as_ptr(), &mut sid) };
             if derived < 0 {
-                return Err(io::Error::from_raw_os_error(derived));
+                return Err(hresult_error(derived));
             }
-        } else if created < 0 {
-            return Err(io::Error::from_raw_os_error(created));
-        }
+            false
+        } else if result < 0 {
+            return Err(hresult_error(result));
+        } else {
+            true
+        };
         if sid.is_null() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -118,11 +144,43 @@ impl AppContainerProfile {
             sid: AppContainerSid(sid),
             _capabilities: derivations,
             capability_attributes,
+            name: name_w,
+            created,
         })
     }
 
-    /// The profile's SID in standard string form, for ACLs granting the
-    /// container access to selected files or directories.
+    /// Whether this call created the profile.
+    ///
+    /// `false` means a profile with this name already existed and was opened.
+    /// An existing profile may belong to another program or to an earlier
+    /// version of yours, and it keeps every access rule ever granted to its SID.
+    pub fn was_created(&self) -> bool {
+        self.created
+    }
+
+    /// Deletes the profile from Windows: its registry data and its folder
+    /// under `%LOCALAPPDATA%\Packages`.
+    ///
+    /// Access granted with [`grant_path`](Self::grant_path) is not removed,
+    /// because those rules live on the files themselves and name the
+    /// profile's SID. A process already running in the container keeps
+    /// running.
+    pub fn delete(self) -> io::Result<()> {
+        // SAFETY: `self.name` is the NUL-terminated profile name retained from
+        // construction and remains live through the call.
+        let result = unsafe { DeleteAppContainerProfile(self.name.as_ptr()) };
+        if result < 0 {
+            return Err(hresult_error(result));
+        }
+        Ok(())
+    }
+
+    /// The profile's SID in standard string form, for security descriptors on
+    /// files, directories, and named pipes.
+    ///
+    /// A named-pipe descriptor must also allow the user and carry the low
+    /// mandatory label `S:(ML;;NW;;;LW)`, because an AppContainer runs at low
+    /// integrity.
     pub fn sid_string(&self) -> io::Result<String> {
         let mut string = ptr::null_mut();
         // SAFETY: `self.sid` is a live SID and `string` is a local out
@@ -151,12 +209,19 @@ impl AppContainerProfile {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SID string was not Unicode"))
     }
 
-    /// Adds an inheritable access rule for this profile to an existing file
-    /// or directory DACL without replacing its other access rules.
+    /// Adds an inheritable access rule for this profile to an existing file or
+    /// directory DACL without replacing its other access rules.
     ///
-    /// The ACE is inherited by children created later. Call this for every
-    /// existing path that needs access. `ReadWrite` also grants delete access
-    /// so a child can replace files inside an approved writable directory.
+    /// Windows propagates inheritable rules to existing descendants when the
+    /// DACL is set, so on a directory this rewrites the ACL of every file and
+    /// folder under it, which can take a while on a large tree. Files created
+    /// later inherit the rule too.
+    ///
+    /// The grant is persistent: it stays after this value is dropped, after
+    /// the launched processes exit and after the profile is deleted, and this
+    /// crate has no call to remove it. [`AppContainerAccess::ReadWrite`] also
+    /// grants delete access, so a child can replace files inside a writable
+    /// directory.
     pub fn grant_path(&self, path: impl AsRef<Path>, access: AppContainerAccess) -> io::Result<()> {
         grant_sid_access(path.as_ref(), self.sid.0, access)
     }
@@ -177,17 +242,15 @@ impl AppContainerProfile {
 
 /// Filesystem rights granted by [`AppContainerProfile::grant_path`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum AppContainerAccess {
-    /// Read and execute access.
+    /// Lists directories and reads files and attributes, without execute access.
     Read,
-    /// Read, write, execute, and delete access.
+    /// Reads, writes, and deletes files, without execute access.
     ReadWrite,
 }
 
 fn grant_sid_access(path: &Path, sid: PSID, access: AppContainerAccess) -> io::Result<()> {
-    const GENERIC_READ: u32 = 0x8000_0000;
-    const GENERIC_WRITE: u32 = 0x4000_0000;
-    const DELETE: u32 = 0x0001_0000;
     let path = wide_null(path.as_os_str())?;
     let mut old_dacl: *mut ACL = ptr::null_mut();
     let mut descriptor = ptr::null_mut();
@@ -251,6 +314,14 @@ fn grant_sid_access(path: &Path, sid: PSID, access: AppContainerAccess) -> io::R
     Ok(())
 }
 
+fn hresult_error(hr: i32) -> io::Error {
+    if ((hr as u32 >> 16) & 0x1fff) == 7 {
+        io::Error::from_raw_os_error((hr as u32 & 0xffff) as i32)
+    } else {
+        io::Error::other(format!("HRESULT 0x{:08X}", hr as u32))
+    }
+}
+
 struct LocalBlock(*mut std::ffi::c_void);
 
 impl Drop for LocalBlock {
@@ -266,6 +337,7 @@ impl std::fmt::Debug for AppContainerProfile {
         f.debug_struct("AppContainerProfile")
             .field("sid", &self.sid)
             .field("capability_count", &self.capability_attributes.len())
+            .field("created", &self.created)
             .finish()
     }
 }
@@ -318,8 +390,9 @@ impl DerivedCapability {
             )
         } == 0
         {
-            // SAFETY: failure may still leave one or both API output
-            // allocations populated; free every returned block.
+            let error = io::Error::last_os_error();
+            // SAFETY: failure may still leave one or both API output pointer
+            // arrays populated; free every returned array block.
             if !group_array.is_null() {
                 // SAFETY: this is an API output allocation from the failed call.
                 unsafe { LocalFree(group_array.cast()) };
@@ -328,34 +401,35 @@ impl DerivedCapability {
                 // SAFETY: this is an API output allocation from the failed call.
                 unsafe { LocalFree(capability_array.cast()) };
             }
-            return Err(io::Error::last_os_error());
+            return Err(error);
         }
+
+        let capability_sids = if capability_count == 0 || capability_array.is_null() {
+            Vec::new()
+        } else {
+            // SAFETY: Windows returned `capability_count` entries in this array.
+            unsafe { std::slice::from_raw_parts(capability_array, capability_count as usize) }
+                .to_vec()
+        };
+        let group_sids = if group_count == 0 || group_array.is_null() {
+            Vec::new()
+        } else {
+            // SAFETY: Windows returned `group_count` entries in this array.
+            unsafe { std::slice::from_raw_parts(group_array, group_count as usize) }.to_vec()
+        };
+        let derived = Self {
+            capability_sids,
+            capability_array,
+            group_sids,
+            group_array,
+        };
         if capability_count == 0 || capability_array.is_null() {
-            // SAFETY: successful derivation returned this LocalAlloc array.
-            unsafe { LocalFree(group_array.cast()) };
-            // SAFETY: successful derivation returned this LocalAlloc array.
-            unsafe { LocalFree(capability_array.cast()) };
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Windows resolved no capability SIDs",
             ));
         }
-        // SAFETY: Windows returned `capability_count` entries in this array.
-        let capability_sids =
-            unsafe { std::slice::from_raw_parts(capability_array, capability_count as usize) }
-                .to_vec();
-        let group_sids = if group_count == 0 || group_array.is_null() {
-            Vec::new()
-        } else {
-            // SAFETY: Windows returned `group_count` entries in this array.
-            unsafe { std::slice::from_raw_parts(group_array, group_count as usize).to_vec() }
-        };
-        Ok(Self {
-            capability_sids,
-            capability_array,
-            group_sids,
-            group_array,
-        })
+        Ok(derived)
     }
 }
 
@@ -379,4 +453,27 @@ impl Drop for DerivedCapability {
     }
 }
 
-const _: () = assert!(size_of::<SECURITY_CAPABILITIES>() > 0);
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<AppContainerProfile>();
+    assert_send_sync::<crate::Launch<'static>>();
+};
+
+#[cfg(test)]
+mod tests {
+    use super::hresult_error;
+
+    #[test]
+    fn win32_hresult_preserves_the_win32_error_code() {
+        let error = hresult_error(0x8007_0005_u32 as i32);
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn non_win32_hresult_keeps_its_hexadecimal_identity() {
+        let error = hresult_error(0x8000_ffff_u32 as i32);
+        assert_eq!(error.raw_os_error(), None);
+        assert!(error.to_string().contains("HRESULT 0x8000FFFF"));
+    }
+}

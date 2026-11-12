@@ -4,6 +4,7 @@
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::marker::PhantomData;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, OwnedHandle, RawHandle};
@@ -219,7 +220,9 @@ impl<'a> Launch<'a> {
     /// own; services running as LocalSystem hold both. Windows does not let a
     /// child in another session inherit handles, so a launch into another
     /// session must not set standard handles or call
-    /// [`inherit`](Self::inherit).
+    /// [`inherit`](Self::inherit). This cannot be combined with
+    /// [`app_container`](Self::app_container); the `spawn_*` methods fail with
+    /// [`io::ErrorKind::InvalidInput`] when both are configured.
     pub fn as_user(&mut self, token: &'a PrimaryToken) -> &mut Self {
         self.token = Some(token);
         self
@@ -234,7 +237,9 @@ impl<'a> Launch<'a> {
 
     /// Creates the child in `profile`'s AppContainer with exactly its
     /// configured capabilities. This attribute is combined with the explicit
-    /// inherited-handle list when both are present.
+    /// inherited-handle list when both are present. This cannot be combined
+    /// with [`as_user`](Self::as_user); the `spawn_*` methods fail with
+    /// [`io::ErrorKind::InvalidInput`] when both are configured.
     pub fn app_container(&mut self, profile: &'a AppContainerProfile) -> &mut Self {
         self.app_container = Some(profile);
         self
@@ -243,6 +248,13 @@ impl<'a> Launch<'a> {
     /// Creates the child suspended. Nothing in it runs until
     /// [`SuspendedChild::resume`].
     pub fn spawn_suspended(&mut self) -> io::Result<SuspendedChild> {
+        if self.token.is_some() && self.app_container.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an AppContainer launch cannot use as_user: the profile belongs to the calling user, not the token's user",
+            ));
+        }
+
         let application = wide_null(&self.executable)?;
         let mut command_line = command_line(&self.executable, &self.arguments)?;
         let current_dir = self.current_dir.as_ref().map(wide_null).transpose()?;
@@ -273,15 +285,12 @@ impl<'a> Launch<'a> {
             }
         }
 
-        let mut security_capabilities = self
-            .app_container
-            .map(AppContainerProfile::security_capabilities);
-        let mut attributes = if handles.is_empty() && security_capabilities.is_none() {
+        let mut attributes = if handles.is_empty() && self.app_container.is_none() {
             None
         } else {
             Some(AttributeList::with_attributes(
                 &handles,
-                security_capabilities.as_mut(),
+                self.app_container,
             )?)
         };
         let inheritable = InheritableWindow::open(&self.inherited)?;
@@ -327,7 +336,9 @@ impl<'a> Launch<'a> {
             // CREATE_UNICODE_ENVIRONMENT; `startup` carries live standard
             // handles and, when present, an initialized attribute list whose
             // handles are all inheritable for this call; `information` is a
-            // local out structure.
+            // local out structure. The attribute list owns its handle array and
+            // boxed security-capabilities value, whose profile borrow keeps all
+            // referenced SIDs live through process creation.
             None => unsafe {
                 CreateProcessW(
                     application.as_ptr(),
@@ -342,8 +353,9 @@ impl<'a> Launch<'a> {
                     &mut information,
                 )
             },
-            // SAFETY: as above; the token is a live primary token borrowed for
-            // the lifetime of this launch.
+            // SAFETY: as above, including attribute-list ownership of handles
+            // and any boxed security capabilities and their borrowed profile;
+            // the token is a live primary token borrowed for this launch.
             Some(token) => unsafe {
                 CreateProcessAsUserW(
                     token.as_raw_handle(),
@@ -602,22 +614,27 @@ fn set_inheritable(handle: RawHandle, inheritable: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// A `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` attribute list. The storage is
-/// allocated to the size the OS reports and deleted when dropped.
-struct AttributeList {
+/// A process-thread attribute list owning every value to which its handle-list
+/// and security-capabilities attributes point. Storage is allocated to the size
+/// Windows reports and the initialized list is deleted when dropped.
+struct AttributeList<'a> {
     storage: Vec<usize>,
     initialized: bool,
     /// The list stores a pointer to the handle array, so the array lives here.
     _handles: Vec<HANDLE>,
+    /// Boxed so the security-capabilities attribute points to a stable address.
+    _security_capabilities: Option<Box<SECURITY_CAPABILITIES>>,
+    /// Keeps the profile and every SID referenced by the boxed value alive.
+    _profile: PhantomData<&'a AppContainerProfile>,
 }
 
-impl AttributeList {
+impl<'a> AttributeList<'a> {
     fn with_attributes(
         handles: &[HANDLE],
-        security_capabilities: Option<&mut SECURITY_CAPABILITIES>,
+        app_container: Option<&'a AppContainerProfile>,
     ) -> io::Result<Self> {
         let mut count = u32::from(!handles.is_empty());
-        count += u32::from(security_capabilities.is_some());
+        count += u32::from(app_container.is_some());
         let mut bytes = 0_usize;
         // SAFETY: a null list with a size probe is the documented way to ask
         // for the required byte count; the out pointer is a local.
@@ -629,6 +646,10 @@ impl AttributeList {
             storage: vec![0_usize; bytes.div_ceil(size_of::<usize>())],
             initialized: false,
             _handles: handles.to_vec(),
+            _security_capabilities: app_container
+                .map(AppContainerProfile::security_capabilities)
+                .map(Box::new),
+            _profile: PhantomData,
         };
         // SAFETY: `storage` is at least `bytes` long and word-aligned, and the
         // list is deleted in `Drop` only after this initialization succeeds.
@@ -658,17 +679,20 @@ impl AttributeList {
                 return Err(io::Error::last_os_error());
             }
         }
-        if let Some(capabilities) = security_capabilities {
-            // SAFETY: the initialized list stores a pointer to this
-            // SECURITY_CAPABILITIES value only until CreateProcess returns;
-            // its referenced profile and SID array are borrowed for this
-            // entire spawn call.
+        let capabilities = list
+            ._security_capabilities
+            .as_deref_mut()
+            .map(|value| value as *mut SECURITY_CAPABILITIES);
+        if let Some(capabilities) = capabilities {
+            // SAFETY: the initialized list points to the boxed value owned by
+            // `list`; its profile borrow keeps every referenced SID and SID
+            // array live until after CreateProcess and attribute-list deletion.
             let updated = unsafe {
                 UpdateProcThreadAttribute(
                     list.as_mut_ptr(),
                     0,
                     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
-                    (capabilities as *mut SECURITY_CAPABILITIES).cast(),
+                    capabilities.cast(),
                     size_of::<SECURITY_CAPABILITIES>(),
                     null_mut(),
                     null(),
@@ -686,11 +710,12 @@ impl AttributeList {
     }
 }
 
-impl Drop for AttributeList {
+impl Drop for AttributeList<'_> {
     fn drop(&mut self) {
         if self.initialized {
-            // SAFETY: the list was initialized in `with_handles` and has not
-            // been deleted since.
+            // SAFETY: the list was initialized in `with_attributes`, has not
+            // been deleted, and all pointed-to handle and security-capabilities
+            // storage remains owned by `self` until this drop completes.
             unsafe { DeleteProcThreadAttributeList(self.as_mut_ptr()) };
         }
     }
