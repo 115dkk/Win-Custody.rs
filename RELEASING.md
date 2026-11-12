@@ -20,14 +20,24 @@ first version is published by hand with an API token:
 4. On `https://crates.io/crates/win-custody/settings`, add a trusted
    publisher: owner `115dkk`, repository `Win-Custody.rs`, workflow
    `release.yml`, environment `crates-io`.
-5. Push the tag `v0.1.0`. The release workflow sees that 0.1.0 is already
-   on crates.io and stops before publishing.
+5. Merge to `main`. The release workflow sees that the version is already on
+   crates.io, skips publishing, and only tags the commit.
 
 ## Later releases
 
 1. Bump `version` in `Cargo.toml`.
 2. Turn the top of `CHANGELOG.md` into `## <version> - <YYYY-MM-DD>`.
 3. Merge to `main` with CI green.
-4. Push the tag `v<version>` on that commit. `release.yml` checks that the
-   tag, the manifest and the changelog agree, runs the tests on Windows, and
-   publishes through trusted publishing.
+
+That is all. `release.yml` runs on every push to `main` and first checks
+that the changelog has a dated entry for the manifest version. When that
+version is not on crates.io yet, it runs the tests on Windows, publishes
+through trusted publishing, and tags the commit `v<version>`. Otherwise it
+only makes sure the tag exists; it does not start a Windows runner or touch
+the `crates-io` environment.
+
+A push to `main` that bumps the version without dating the changelog fails
+the release workflow and publishes nothing. If a publish or the tag step
+fails for another reason, re-run it from the Actions tab (`Run workflow` on
+`main`); a version that is already published is skipped, and an existing
+tag is left alone.

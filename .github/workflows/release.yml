@@ -1,12 +1,16 @@
 name: Release
 
-# Publishes to crates.io when a `v<version>` tag is pushed, through crates.io
-# trusted publishing (no stored token). The first release of a crate cannot use
-# trusted publishing; see RELEASING.md.
+# Publishes to crates.io whenever `main` carries a version that is not on
+# crates.io yet, through crates.io trusted publishing (no stored token), then
+# tags that commit `v<version>`. Every other push to `main` stops after the
+# version check. The first release of a crate cannot use trusted publishing;
+# see RELEASING.md.
 
 on:
   push:
-    tags: ['v*']
+    branches: [main]
+  # Re-runs a release whose publish or tag step failed.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,31 +18,29 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Two pushes to main in quick succession must not publish twice.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
-  publish:
-    name: publish to crates.io
-    # Windows, so the verification build in `cargo publish` compiles the real
-    # code rather than the empty crate other targets see.
-    runs-on: windows-2025
-    environment: crates-io
-    permissions:
-      contents: read
-      id-token: write
+  check:
+    name: check the version
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      published: ${{ steps.version.outputs.published }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Check the tag, the manifest and the changelog agree
+      - name: Check the manifest and the changelog agree
         id: version
-        shell: bash
         run: |
-          tag="${GITHUB_REF_NAME#v}"
           manifest="$(cargo metadata --no-deps --format-version 1 \
             | grep -o '"version":"[^"]*"' | head -n 1 | cut -d '"' -f 4)"
-          if [ "$tag" != "$manifest" ]; then
-            echo "::error::tag v$tag does not match Cargo.toml version $manifest"
-            exit 1
-          fi
+          echo "version=$manifest" >> "$GITHUB_OUTPUT"
           if ! tr -d '\r' < CHANGELOG.md | grep -Eq "^## $manifest - [0-9]{4}-[0-9]{2}-[0-9]{2}$"; then
             echo "::error::CHANGELOG.md has no dated '## $manifest - YYYY-MM-DD' entry"
             exit 1
@@ -53,16 +55,58 @@ jobs:
             echo "published=false" >> "$GITHUB_OUTPUT"
           fi
 
+  publish:
+    name: publish to crates.io
+    needs: check
+    if: needs.check.outputs.published == 'false'
+    # Windows, so the verification build in `cargo publish` compiles the real
+    # code rather than the empty crate other targets see.
+    runs-on: windows-2025
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
       - name: Test
-        if: steps.version.outputs.published == 'false'
         run: cargo test --all-targets
 
       - uses: rust-lang/crates-io-auth-action@v1
-        if: steps.version.outputs.published == 'false'
         id: auth
 
       - name: Publish
-        if: steps.version.outputs.published == 'false'
         run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  tag:
+    name: tag the release
+    needs: [check, publish]
+    # Runs after a publish, and also when the version was already published,
+    # so a missing tag is filled in. Never after a failed publish.
+    if: >-
+      always() &&
+      needs.check.result == 'success' &&
+      (needs.publish.result == 'success' || needs.publish.result == 'skipped')
+    # Its own job, so the token that can push tags never runs the build.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Tag v<version> unless the tag exists
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          tag="v$VERSION"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" > /dev/null; then
+            echo "$tag already exists."
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              tag -a "$tag" "$GITHUB_SHA" -m "win-custody $VERSION"
+          git push origin "refs/tags/$tag"
