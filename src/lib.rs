@@ -1,8 +1,8 @@
 //! Take custody of Windows child processes.
 //!
 //! A parent that launches helpers on Windows has to decide four things for
-//! every child, and the Win32 defaults get each of them wrong for a service or
-//! a launcher:
+//! every child, plus a fifth when it does not trust the child. The Win32
+//! defaults get each of them wrong for a service or a launcher:
 //!
 //! * **What it inherits.** [`Launch`] passes an explicit
 //!   `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, so the child receives exactly the
@@ -18,14 +18,25 @@
 //!   rules for the pipes ([`PipeServer`]), mutexes ([`NamedMutex`]), jobs and
 //!   directory trees you share with the child, and [`PipeServer`] tells you the
 //!   process ID of whoever connected.
+//! * **What it can touch, if you ask.** [`AppContainerProfile`] and
+//!   [`Launch::app_container`] run the child in an AppContainer with the
+//!   capabilities you name and the paths you grant. This is opt-in.
 //!
-//! # Not a sandbox
+//! # Sandboxing is opt-in
 //!
-//! Nothing here confines what a child can do with the rights its token
-//! already has. A job object ties the child's lifetime and resource use to
-//! yours; it does not stop the child from reading files, writing the registry
-//! or opening network connections. Run untrusted code in an AppContainer or
-//! a separate low-privilege account instead.
+//! A [`Launch`] without [`Launch::app_container`] confines nothing. It does
+//! not limit what a child can do with the rights its token already has: a job
+//! object ties the child's lifetime and resource use to yours, but does not
+//! stop the child from reading files, writing the registry or opening network
+//! connections.
+//!
+//! With [`Launch::app_container`], the child runs in a plain AppContainer, not
+//! a Less Privileged AppContainer (LPAC). It keeps everything Windows grants
+//! to `ALL APPLICATION PACKAGES`, and the launch cannot be combined with
+//! [`Launch::as_user`]. Access given with [`AppContainerProfile::grant_path`]
+//! is written into the files' ACLs and outlives the process and the profile.
+//! For code that needs stronger isolation, use a separate low-privilege
+//! account.
 //!
 //! # Example
 //!
