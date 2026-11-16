@@ -4,6 +4,20 @@ All notable changes to this crate are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate
 follows [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- `PrivilegeGuard` disabled its privilege when dropped, even when the
+  privilege was already enabled before the guard was created or another guard
+  for it was still alive. A guard now leaves an already enabled privilege as
+  it was, and guards for the same privilege are counted, so the privilege is
+  disabled only when the last of them is dropped. Before, a dropped guard for
+  `SeChangeNotifyPrivilege`, which every token has enabled, left the process
+  without it, and a child started afterwards could no longer pass through
+  directories it may not list; an AppContainer child whose working directory
+  lies under the user profile then failed to start with access denied.
+
 ## 0.1.4 - 2026-11-16
 
 ### Fixed

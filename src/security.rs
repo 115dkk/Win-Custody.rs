@@ -16,6 +16,7 @@ use std::mem::size_of;
 use std::os::windows::io::{AsHandle, AsRawHandle, OwnedHandle, RawHandle};
 use std::path::Path;
 use std::ptr::{self, NonNull};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use windows_sys::Win32::Foundation::{
     LocalFree, SetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_ALL_ASSIGNED, ERROR_SUCCESS, LUID,
@@ -405,11 +406,28 @@ pub fn current_token_is_member_of(group: &OwnedSid) -> io::Result<bool> {
     Ok(is_member != 0)
 }
 
-/// A privilege enabled in the process token for this value's lifetime, and
-/// disabled again when it is dropped.
+/// A privilege enabled in the process token for this value's lifetime.
+///
+/// Every thread shares the process token, so guards for the same privilege
+/// are counted: the privilege stays enabled until the last of them is dropped
+/// and is disabled then. A privilege that was already enabled before its first
+/// guard, such as `SeChangeNotifyPrivilege` in every token, is left enabled.
 pub struct PrivilegeGuard {
     token: OwnedHandle,
     luid: LUID,
+    /// Whether this guard is one of those counted in [`TURNED_ON`].
+    counted: bool,
+}
+
+/// The privileges guards turned on, as `(LowPart, HighPart)` of the LUID, each
+/// with the number of live guards. A privilege that was enabled before its
+/// first guard is absent: no guard turned it on, so none turns it off.
+static TURNED_ON: Mutex<Vec<((u32, i32), usize)>> = Mutex::new(Vec::new());
+
+fn lock_turned_on() -> MutexGuard<'static, Vec<((u32, i32), usize)>> {
+    // The list is consistent after every statement that changes it, so a
+    // panic elsewhere while it was locked leaves nothing to repair.
+    TURNED_ON.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl std::fmt::Debug for PrivilegeGuard {
@@ -437,19 +455,26 @@ impl PrivilegeGuard {
             return Err(io::Error::last_os_error());
         }
         let privileges = token_privileges(luid, SE_PRIVILEGE_ENABLED);
+        let mut previous = TOKEN_PRIVILEGES::default();
+        let mut previous_bytes = 0_u32;
+        // Held across the adjustment, so that a guard being dropped on another
+        // thread cannot disable the privilege between the call and the count.
+        let mut turned_on = lock_turned_on();
         // SAFETY: clearing last-error is required because a successful
         // AdjustTokenPrivileges reports partial assignment through last-error.
         unsafe { SetLastError(ERROR_SUCCESS) };
-        // SAFETY: the token has adjust rights and `privileges` is a complete,
-        // live one-entry TOKEN_PRIVILEGES value; previous state is not requested.
+        // SAFETY: the token has adjust and query rights and `privileges` is a
+        // complete, live one-entry TOKEN_PRIVILEGES value; `previous` is a
+        // local one-entry buffer of the stated size, enough for the one
+        // privilege that can change, and `previous_bytes` is a local output.
         let adjusted = unsafe {
             AdjustTokenPrivileges(
                 token.as_raw_handle(),
                 0,
                 &privileges,
-                0,
-                ptr::null_mut(),
-                ptr::null_mut(),
+                size_of::<TOKEN_PRIVILEGES>() as u32,
+                &mut previous,
+                &mut previous_bytes,
             )
         };
         if adjusted == 0 {
@@ -462,12 +487,44 @@ impl PrivilegeGuard {
                 format!("the current token does not hold {name}"),
             ));
         }
-        Ok(Self { token, luid })
+        // Windows reports only the privileges the call changed, so an empty
+        // previous state means this one was enabled already.
+        let changed = previous.PrivilegeCount != 0;
+        let key = (luid.LowPart, luid.HighPart);
+        let counted = match turned_on.iter_mut().find(|entry| entry.0 == key) {
+            Some(entry) => {
+                entry.1 += 1;
+                true
+            }
+            None if changed => {
+                turned_on.push((key, 1));
+                true
+            }
+            None => false,
+        };
+        Ok(Self {
+            token,
+            luid,
+            counted,
+        })
     }
 }
 
 impl Drop for PrivilegeGuard {
     fn drop(&mut self) {
+        if !self.counted {
+            return;
+        }
+        let mut turned_on = lock_turned_on();
+        let key = (self.luid.LowPart, self.luid.HighPart);
+        let Some(index) = turned_on.iter().position(|entry| entry.0 == key) else {
+            return;
+        };
+        turned_on[index].1 -= 1;
+        if turned_on[index].1 != 0 {
+            return;
+        }
+        turned_on.swap_remove(index);
         let privileges = token_privileges(self.luid, 0);
         // SAFETY: the token remains live through drop and `privileges` is a
         // complete one-entry value; disabling is best effort by contract.
@@ -506,12 +563,20 @@ fn open_current_process_token(access: u32) -> io::Result<OwnedHandle> {
 
 #[cfg(test)]
 mod tests {
-    use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr::null;
+
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, LUID};
+    use windows_sys::Win32::Security::{
+        LookupPrivilegeValueW, PrivilegeCheck, LUID_AND_ATTRIBUTES, PRIVILEGE_SET, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::SystemServices::PRIVILEGE_SET_ALL_NECESSARY;
 
     use super::{
-        current_token_is_member_of, current_user_sid_string, ObjectSecurityDescriptor, OwnedSid,
-        PrivilegeGuard, SecurityDescriptor,
+        current_token_is_member_of, current_user_sid_string, open_current_process_token,
+        ObjectSecurityDescriptor, OwnedSid, PrivilegeGuard, SecurityDescriptor,
     };
+    use crate::wide::wide_null;
 
     #[test]
     fn a_tree_reset_from_sddl_reads_back_as_the_same_allowed_aces() {
@@ -555,5 +620,52 @@ mod tests {
     fn held_privileges_enable_and_unknown_names_fail() {
         drop(PrivilegeGuard::enable("SeChangeNotifyPrivilege").unwrap());
         assert!(PrivilegeGuard::enable("SeNotARealPrivilege").is_err());
+    }
+
+    /// Whether `name` is enabled in the process token right now.
+    fn privilege_is_enabled(name: &str) -> bool {
+        let token = open_current_process_token(TOKEN_QUERY).unwrap();
+        let name = wide_null(name).unwrap();
+        let mut luid = LUID::default();
+        // SAFETY: `name` is NUL-terminated and `luid` is a local output.
+        let found = unsafe { LookupPrivilegeValueW(null(), name.as_ptr(), &mut luid) };
+        assert_ne!(found, 0, "{}", std::io::Error::last_os_error());
+        let mut required = PRIVILEGE_SET {
+            PrivilegeCount: 1,
+            Control: PRIVILEGE_SET_ALL_NECESSARY,
+            Privilege: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: 0,
+            }],
+        };
+        let mut enabled = 0;
+        // SAFETY: the token is live with query access, `required` is a
+        // complete one-entry set and `enabled` is a local output.
+        let checked = unsafe { PrivilegeCheck(token.as_raw_handle(), &mut required, &mut enabled) };
+        assert_ne!(checked, 0, "{}", std::io::Error::last_os_error());
+        enabled != 0
+    }
+
+    #[test]
+    fn a_guard_leaves_a_privilege_that_was_already_enabled_enabled() {
+        // Every token holds SeChangeNotifyPrivilege, enabled from the start.
+        // Without it a child cannot pass through directories it may not list.
+        assert!(privilege_is_enabled("SeChangeNotifyPrivilege"));
+        drop(PrivilegeGuard::enable("SeChangeNotifyPrivilege").unwrap());
+        assert!(privilege_is_enabled("SeChangeNotifyPrivilege"));
+    }
+
+    #[test]
+    fn a_privilege_stays_enabled_until_its_last_guard_is_dropped() {
+        // Held by every user, and disabled until asked for.
+        let name = "SeIncreaseWorkingSetPrivilege";
+        assert!(!privilege_is_enabled(name));
+        let first = PrivilegeGuard::enable(name).unwrap();
+        let second = PrivilegeGuard::enable(name).unwrap();
+        assert!(privilege_is_enabled(name));
+        drop(first);
+        assert!(privilege_is_enabled(name));
+        drop(second);
+        assert!(!privilege_is_enabled(name));
     }
 }
