@@ -45,7 +45,9 @@ This project is maintained in spare time, so there is no guaranteed response
 time. The maintainer reads every report and answers in the report's private
 thread. A confirmed vulnerability is fixed in a new release on crates.io, and
 the maintainer then publishes a GitHub security advisory that credits the
-reporter unless the reporter asks not to be named, and submits it to the
-[RustSec advisory database](https://rustsec.org/).
+reporter unless the reporter asks not to be named. GitHub reviews published
+advisories for the
+[GitHub Advisory Database](https://github.com/advisories), which is where
+Dependabot alerts come from.
 
 There is no bug bounty.
