@@ -50,17 +50,22 @@ advisories for the
 [GitHub Advisory Database](https://github.com/advisories), which is where
 Dependabot alerts come from.
 
-The advisory is also submitted to the
+An advisory is also submitted to the
 [RustSec advisory database](https://rustsec.org/), which `cargo audit` and
-`cargo deny` read, for as long as this crate meets the notability bar that
-RustSec's maintainers
-[apply](https://github.com/rustsec/advisory-db/pull/3017#issuecomment-5254097043):
-at least one crate on crates.io from a different author depends on it, or it
-has more than 1,000 recent downloads, or 100,000 downloads in total. Below
-that bar the maintainer does not submit, because RustSec declines advisories
-for crates that few people use. In November 2026 `win-custody` meets it, with
-four dependent crates from three other authors and about 7,400 recent
-downloads. RustSec's maintainers also decide whether a given defect is one
-their database tracks, so a submission can still be declined.
+`cargo deny` read, when both of these hold:
+
+- The defect is of a kind RustSec
+  [tracks](https://github.com/rustsec/advisory-db/blob/main/CONTRIBUTING.md#criteria),
+  such as code execution, memory corruption, privilege escalation or file
+  disclosure. A defect that gives an attacker nothing they did not already
+  have stays a GitHub advisory only. GHSA-4cxw-9fpf-wwmp, which leaks a
+  suspended process and the handles it inherited, is one of those.
+- The crate meets the notability bar RustSec's maintainers
+  [apply](https://github.com/rustsec/advisory-db/pull/3017#issuecomment-5254097043):
+  at least one crate on crates.io from a different author depends on it, or it
+  has more than 1,000 recent downloads, or 100,000 downloads in total. RustSec
+  declines advisories for crates below it. In November 2026 `win-custody`
+  meets it, with four dependent crates from three other authors and about
+  7,400 recent downloads.
 
 There is no bug bounty.

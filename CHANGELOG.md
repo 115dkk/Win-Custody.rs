@@ -8,10 +8,12 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- `SECURITY.md` says when an advisory is also submitted to RustSec: for as
-  long as the crate meets the notability bar RustSec's maintainers apply (a
-  dependent crate from a different author, more than 1,000 recent downloads,
-  or 100,000 downloads in total), which it does today.
+- `SECURITY.md` says when an advisory is also submitted to RustSec: when the
+  defect is of a kind RustSec tracks, and the crate meets the notability bar
+  RustSec's maintainers apply (a dependent crate from a different author, more
+  than 1,000 recent downloads, or 100,000 downloads in total), which it does
+  today. GHSA-4cxw-9fpf-wwmp gives an attacker nothing they did not already
+  have, so it stays a GitHub advisory only.
 
 ## 0.1.5 - 2026-11-16
 
