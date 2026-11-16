@@ -4,6 +4,15 @@ All notable changes to this crate are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate
 follows [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Changed
+
+- `SECURITY.md` says when an advisory is also submitted to RustSec: for as
+  long as the crate meets the notability bar RustSec's maintainers apply (a
+  dependent crate from a different author, more than 1,000 recent downloads,
+  or 100,000 downloads in total), which it does today.
+
 ## 0.1.5 - 2026-11-16
 
 ### Changed
