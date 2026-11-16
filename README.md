@@ -11,7 +11,7 @@ owned types.
 | You want the child to | Use |
 |---|---|
 | inherit exactly the handles you name, nothing else that is inheritable in your process | `Launch` (explicit `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) |
-| die with you, even when your process is killed | `Job` with `JobLimits::kill_on_close`, joined before the child's first instruction by `Launch::spawn_in_job` |
+| die with you, even when your process is killed | `Job` with `JobLimits::kill_on_close`; `Launch::spawn_in_job` creates the child inside the job (`PROC_THREAD_ATTRIBUTE_JOB_LIST`) |
 | run as the logged-on user, or as your service on that user's desktop | `PrimaryToken::for_session_user`, `PrimaryToken::duplicate_current_process` + `set_session_id`, then `Launch::as_user` |
 | run in an AppContainer, with only the capabilities and paths you grant (opt-in) | `AppContainerProfile::create_or_open`, `grant_path`, then `Launch::app_container` |
 | be reachable only by the principals you choose | `SecurityDescriptor::from_sddl` for `PipeServer`, `NamedMutex`, `Job` and directory trees |
@@ -113,9 +113,8 @@ low-privilege account.
   unstable as of Rust 1.99.
 - [`win32job`](https://crates.io/crates/win32job) and
   [`process-wrap`](https://crates.io/crates/process-wrap) manage job objects
-  well. `win-custody` adds the suspended-create, assign, resume order that puts
-  the child in the job before it runs, together with the handle list and
-  tokens.
+  well. `win-custody` creates the child inside the job, so it never exists
+  outside it, together with the handle list and tokens.
 - [`interprocess`](https://crates.io/crates/interprocess) is the general
   cross-platform IPC crate. The pipes here are narrower: single-instance,
   local-only, first-instance-only, deadline-bound, with peer PID checks.
@@ -141,6 +140,12 @@ the dependencies of a cross-platform project.
 ## Minimum supported Rust version
 
 Rust 1.77.
+
+## Minimum supported Windows version
+
+Windows 10 and Windows Server 2016. `Launch::spawn_in_job` and
+`Launch::spawn_suspended_in_job` use `PROC_THREAD_ATTRIBUTE_JOB_LIST`, which
+older systems do not have, and fail there.
 
 ## Origin
 

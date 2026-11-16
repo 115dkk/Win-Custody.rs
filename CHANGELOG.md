@@ -4,6 +4,32 @@ All notable changes to this crate are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate
 follows [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- `Launch::spawn_in_job` created the child first and assigned it to the job
+  afterwards. If the parent was killed between the two steps, the child stayed
+  behind, suspended and outside the job, so it outlived a kill-on-close job.
+  The child is now created inside the job with
+  `PROC_THREAD_ATTRIBUTE_JOB_LIST` and never exists outside it
+  (GHSA-4cxw-9fpf-wwmp).
+
+### Added
+
+- `Launch::spawn_suspended_in_job`: creates the child suspended and already a
+  member of the job, for callers that prepare the child before resuming it.
+  Use it instead of `Launch::spawn_suspended` followed by `Job::assign`.
+
+### Changed
+
+- `Launch::spawn_in_job` needs Windows 10 or Windows Server 2016, where
+  `PROC_THREAD_ATTRIBUTE_JOB_LIST` was introduced. On older systems it fails
+  instead of assigning the child after creating it.
+- When the job refuses the child, for example at its active-process limit,
+  `Launch::spawn_in_job` fails without creating a process. Before, it created
+  the child and terminated it.
+
 ## 0.1.3 - 2026-11-12
 
 ### Added

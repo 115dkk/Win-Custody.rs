@@ -8,9 +8,9 @@
 //!   `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, so the child receives exactly the
 //!   handles you name and nothing else that happens to be inheritable in your
 //!   process. The standard library cannot do this on stable Rust.
-//! * **How long it lives.** [`Job`] puts the child in a kill-on-close job
-//!   object before its first instruction runs, so it cannot outlive you, even
-//!   when your process is killed.
+//! * **How long it lives.** [`Launch::spawn_in_job`] creates the child inside
+//!   a kill-on-close [`Job`], so it never exists outside the job and cannot
+//!   outlive you, even when your process is killed.
 //! * **Who it runs as.** [`PrimaryToken`] lets a service start the child in
 //!   another session, as the logged-on user or as itself on that user's
 //!   desktop.
