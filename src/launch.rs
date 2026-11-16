@@ -30,8 +30,8 @@ use windows_sys::Win32::System::Threading::{
     InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
     LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    STARTUPINFOW,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
 use crate::app_container::AppContainerProfile;
@@ -247,7 +247,44 @@ impl<'a> Launch<'a> {
 
     /// Creates the child suspended. Nothing in it runs until
     /// [`SuspendedChild::resume`].
+    ///
+    /// This does not put the child in a job. To do that, create it with
+    /// [`spawn_suspended_in_job`](Self::spawn_suspended_in_job) instead of
+    /// calling [`Job::assign`] on the result: a child assigned after it was
+    /// created is outside the job until the assignment returns, and if this
+    /// process is killed in between, the child stays behind, suspended.
     pub fn spawn_suspended(&mut self) -> io::Result<SuspendedChild> {
+        self.create_suspended(None)
+    }
+
+    /// Creates the child suspended and already a member of `job`, through
+    /// `PROC_THREAD_ATTRIBUTE_JOB_LIST`. Windows creates the process inside
+    /// the job, so the child never exists outside it: with
+    /// [`JobLimits::kill_on_close`](crate::JobLimits::kill_on_close) it dies
+    /// with this process even when this process is killed before the call
+    /// returns, and the job's limits apply to it from the start.
+    ///
+    /// If the job refuses the child, for example because its active-process
+    /// limit is reached, the call fails and no process is created. The call
+    /// needs Windows 10 or Windows Server 2016; on an older system it fails
+    /// instead of assigning the child to the job after creating it.
+    pub fn spawn_suspended_in_job(&mut self, job: &Job) -> io::Result<SuspendedChild> {
+        self.create_suspended(Some(job))
+    }
+
+    /// Creates the child inside `job` and lets it run. What that guarantees,
+    /// and when it fails, is described at
+    /// [`spawn_suspended_in_job`](Self::spawn_suspended_in_job).
+    pub fn spawn_in_job(&mut self, job: &Job) -> io::Result<Process> {
+        self.spawn_suspended_in_job(job)?.resume()
+    }
+
+    /// Creates the child and lets it run.
+    pub fn spawn(&mut self) -> io::Result<Process> {
+        self.spawn_suspended()?.resume()
+    }
+
+    fn create_suspended(&mut self, job: Option<&Job>) -> io::Result<SuspendedChild> {
         if self.token.is_some() && self.app_container.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -285,12 +322,14 @@ impl<'a> Launch<'a> {
             }
         }
 
-        let mut attributes = if handles.is_empty() && self.app_container.is_none() {
+        let mut attributes = if handles.is_empty() && self.app_container.is_none() && job.is_none()
+        {
             None
         } else {
             Some(AttributeList::with_attributes(
                 &handles,
                 self.app_container,
+                job,
             )?)
         };
         let inheritable = InheritableWindow::open(&self.inherited)?;
@@ -336,9 +375,10 @@ impl<'a> Launch<'a> {
             // CREATE_UNICODE_ENVIRONMENT; `startup` carries live standard
             // handles and, when present, an initialized attribute list whose
             // handles are all inheritable for this call; `information` is a
-            // local out structure. The attribute list owns its handle array and
-            // boxed security-capabilities value, whose profile borrow keeps all
-            // referenced SIDs live through process creation.
+            // local out structure. The attribute list owns its handle array,
+            // its boxed job handle and its boxed security-capabilities value;
+            // the profile borrow keeps all referenced SIDs live, and the job
+            // borrow keeps the job handle open, through process creation.
             None => unsafe {
                 CreateProcessW(
                     application.as_ptr(),
@@ -353,9 +393,10 @@ impl<'a> Launch<'a> {
                     &mut information,
                 )
             },
-            // SAFETY: as above, including attribute-list ownership of handles
-            // and any boxed security capabilities and their borrowed profile;
-            // the token is a live primary token borrowed for this launch.
+            // SAFETY: as above, including attribute-list ownership of handles,
+            // any boxed job handle with its borrowed job, and any boxed
+            // security capabilities with their borrowed profile; the token is
+            // a live primary token borrowed for this launch.
             Some(token) => unsafe {
                 CreateProcessAsUserW(
                     token.as_raw_handle(),
@@ -400,20 +441,6 @@ impl<'a> Launch<'a> {
             (Err(error), _) => Err(error),
         }
     }
-
-    /// Creates the child suspended, assigns it to `job`, and only then lets it
-    /// run, so it is in the job before its first instruction. If any step
-    /// fails the child is terminated.
-    pub fn spawn_in_job(&mut self, job: &Job) -> io::Result<Process> {
-        let child = self.spawn_suspended()?;
-        job.assign(child.process())?;
-        child.resume()
-    }
-
-    /// Creates the child and lets it run.
-    pub fn spawn(&mut self) -> io::Result<Process> {
-        self.spawn_suspended()?.resume()
-    }
 }
 
 /// A child created suspended. Dropping it without calling
@@ -432,8 +459,9 @@ impl SuspendedChild {
         self.pid
     }
 
-    /// The child's process handle, for job assignment and identity checks
-    /// before it runs.
+    /// The child's process handle, for identity checks and other preparation
+    /// before it runs. To put the child in a job, create it there with
+    /// [`Launch::spawn_suspended_in_job`].
     pub fn process(&self) -> &Process {
         self.process.as_ref().expect("present until consumed")
     }
@@ -614,27 +642,33 @@ fn set_inheritable(handle: RawHandle, inheritable: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// A process-thread attribute list owning every value to which its handle-list
-/// and security-capabilities attributes point. Storage is allocated to the size
-/// Windows reports and the initialized list is deleted when dropped.
+/// A process-thread attribute list owning every value to which its
+/// handle-list, job-list and security-capabilities attributes point. Storage is
+/// allocated to the size Windows reports and the initialized list is deleted
+/// when dropped.
 struct AttributeList<'a> {
     storage: Vec<usize>,
     initialized: bool,
     /// The list stores a pointer to the handle array, so the array lives here.
     _handles: Vec<HANDLE>,
+    /// Boxed so the job-list attribute points to a stable address.
+    _job: Option<Box<HANDLE>>,
     /// Boxed so the security-capabilities attribute points to a stable address.
     _security_capabilities: Option<Box<SECURITY_CAPABILITIES>>,
-    /// Keeps the profile and every SID referenced by the boxed value alive.
-    _profile: PhantomData<&'a AppContainerProfile>,
+    /// Keeps alive the profile with every SID the boxed capabilities refer to,
+    /// and the job whose handle the boxed job handle names.
+    _borrows: PhantomData<(&'a AppContainerProfile, &'a Job)>,
 }
 
 impl<'a> AttributeList<'a> {
     fn with_attributes(
         handles: &[HANDLE],
         app_container: Option<&'a AppContainerProfile>,
+        job: Option<&'a Job>,
     ) -> io::Result<Self> {
         let mut count = u32::from(!handles.is_empty());
         count += u32::from(app_container.is_some());
+        count += u32::from(job.is_some());
         let mut bytes = 0_usize;
         // SAFETY: a null list with a size probe is the documented way to ask
         // for the required byte count; the out pointer is a local.
@@ -646,10 +680,11 @@ impl<'a> AttributeList<'a> {
             storage: vec![0_usize; bytes.div_ceil(size_of::<usize>())],
             initialized: false,
             _handles: handles.to_vec(),
+            _job: job.map(|job| Box::new(job.as_raw_handle())),
             _security_capabilities: app_container
                 .map(AppContainerProfile::security_capabilities)
                 .map(Box::new),
-            _profile: PhantomData,
+            _borrows: PhantomData,
         };
         // SAFETY: `storage` is at least `bytes` long and word-aligned, and the
         // list is deleted in `Drop` only after this initialization succeeds.
@@ -671,6 +706,26 @@ impl<'a> AttributeList<'a> {
                     PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
                     pointer.cast(),
                     length,
+                    null_mut(),
+                    null(),
+                )
+            };
+            if updated == 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        let job = list._job.as_deref().map(|handle| handle as *const HANDLE);
+        if let Some(job) = job {
+            // SAFETY: the list is initialized; it points to the boxed job
+            // handle owned by `list`, and the job borrow keeps that handle
+            // open until after CreateProcess and attribute-list deletion.
+            let updated = unsafe {
+                UpdateProcThreadAttribute(
+                    list.as_mut_ptr(),
+                    0,
+                    PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                    job.cast(),
+                    size_of::<HANDLE>(),
                     null_mut(),
                     null(),
                 )
@@ -889,27 +944,33 @@ fn append_argument(line: &mut Vec<u16>, argument: &OsStr) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::ffi::{c_void, OsString};
+    use std::fs::File;
+    use std::io::{Read, Write};
     use std::mem::size_of;
     use std::os::windows::ffi::OsStringExt;
-    use std::os::windows::io::{AsRawHandle, OwnedHandle};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use std::path::Path;
     use std::ptr::{null_mut, NonNull};
     use std::time::Duration;
 
     use windows_sys::Win32::Foundation::{
-        LocalFree, ERROR_INSUFFICIENT_BUFFER, GENERIC_READ, GENERIC_WRITE,
+        LocalFree, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_ENOUGH_QUOTA, GENERIC_READ, GENERIC_WRITE,
     };
     use windows_sys::Win32::Globalization::lstrlenW;
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows_sys::Win32::Security::{
         GetTokenInformation, TokenCapabilities, TOKEN_GROUPS, TOKEN_QUERY,
     };
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
     use windows_sys::Win32::System::Threading::OpenProcessToken;
 
-    use super::{anonymous_pipe, command_line, command_line_tail, read_to_end_bounded, Launch};
+    use super::{
+        anonymous_pipe, command_line, command_line_tail, null_device, read_to_end_bounded, Launch,
+    };
     use crate::handle::{owned_from_creation, WaitOutcome};
     use crate::job::{Job, JobLimits};
     use crate::pipe::{PipeDirection, PipeServer, PipeWait};
+    use crate::process::ProcessAccess;
     use crate::security::{current_user_sid_string, SecurityDescriptor};
     use crate::{AppContainerAccess, AppContainerProfile, PrimaryToken};
 
@@ -1136,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn an_appcontainer_child_is_assigned_before_resume_and_keeps_captured_stdio() {
+    fn an_appcontainer_child_is_created_in_its_job_and_keeps_captured_stdio() {
         let profile = ProfileGuard::new("grant");
         assert!(profile
             .profile()
@@ -1315,6 +1376,147 @@ mod tests {
         drop(job);
         assert_eq!(
             child.wait(Some(Duration::from_secs(30))).unwrap(),
+            WaitOutcome::Signaled
+        );
+    }
+
+    /// Turns `supervisor_process_for_the_killed_parent_test` from a no-op into
+    /// the supervisor. Its value is the inherited handle on which the
+    /// supervisor reports its child's process ID.
+    const SUPERVISOR_REPORT: &str = "WIN_CUSTODY_TEST_SUPERVISOR_REPORT";
+
+    /// Terminates a process the test could not prove dead, so a failing
+    /// assertion never leaves a suspended process behind.
+    struct TerminateOnDrop(crate::Process);
+
+    impl Drop for TerminateOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.terminate(1);
+        }
+    }
+
+    /// Not a test of its own.
+    /// `a_child_created_in_a_job_dies_when_its_parent_is_killed` runs this test
+    /// binary again with [`SUPERVISOR_REPORT`] set, and that process is the
+    /// parent that gets killed.
+    #[test]
+    fn supervisor_process_for_the_killed_parent_test() {
+        let Some(report) = std::env::var_os(SUPERVISOR_REPORT) else {
+            return;
+        };
+        let report: usize = report.to_str().unwrap().parse().unwrap();
+        // SAFETY: the controlling test passed this value for a pipe write end
+        // it let this process inherit, and nothing else here owns it.
+        let mut report = unsafe { File::from_raw_handle(report as RawHandle) };
+        let job = Job::create(&JobLimits::new().kill_on_close(true)).unwrap();
+        let child = Launch::new(cmd())
+            .args(["/d", "/c", "exit 0"])
+            .spawn_suspended_in_job(&job)
+            .unwrap();
+        report.write_all(&child.pid().to_le_bytes()).unwrap();
+        // The controlling test kills this process here, while the child is
+        // still suspended. If it never does, returning drops the child, which
+        // terminates it.
+        std::thread::sleep(Duration::from_secs(120));
+    }
+
+    fn is_in_job(process: &crate::Process, job: &Job) -> bool {
+        let mut member = 0;
+        // SAFETY: both handles are live for the call and `member` is a local
+        // out value.
+        let queried =
+            unsafe { IsProcessInJob(process.as_raw_handle(), job.as_raw_handle(), &mut member) };
+        assert_ne!(queried, 0, "{}", std::io::Error::last_os_error());
+        member != 0
+    }
+
+    #[test]
+    fn a_child_created_in_a_job_is_a_member_while_still_suspended() {
+        let job = Job::create(&JobLimits::new().kill_on_close(true)).unwrap();
+        let outside = Launch::new(cmd())
+            .args(["/d", "/c", "exit 0"])
+            .spawn_suspended()
+            .unwrap();
+        assert!(!is_in_job(outside.process(), &job));
+        let inside = Launch::new(cmd())
+            .args(["/d", "/c", "exit 0"])
+            .spawn_suspended_in_job(&job)
+            .unwrap();
+        assert!(is_in_job(inside.process(), &job));
+    }
+
+    #[test]
+    fn a_full_job_refuses_the_child_instead_of_letting_it_exist_outside() {
+        let job = Job::create(&JobLimits::new().kill_on_close(true).active_processes(1)).unwrap();
+        let _first = Launch::new(cmd())
+            .args(["/d", "/c", "exit 0"])
+            .spawn_suspended_in_job(&job)
+            .unwrap();
+        let error = Launch::new(cmd())
+            .args(["/d", "/c", "exit 0"])
+            .spawn_suspended_in_job(&job)
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(ERROR_NOT_ENOUGH_QUOTA as i32));
+    }
+
+    #[test]
+    fn a_child_created_in_a_job_still_receives_its_standard_output() {
+        let job = Job::create(&JobLimits::new().kill_on_close(true)).unwrap();
+        let (read, write) = anonymous_pipe().unwrap();
+        let child = Launch::new(cmd())
+            .args(["/d", "/c", "echo in-the-job"])
+            .stdout(&write)
+            .spawn_in_job(&job)
+            .unwrap();
+        drop(write);
+        let output = read_to_end_bounded(&read, 4096).unwrap();
+        assert_eq!(
+            child.wait(Some(Duration::from_secs(30))).unwrap(),
+            WaitOutcome::Signaled
+        );
+        assert_eq!(String::from_utf8_lossy(&output).trim(), "in-the-job");
+    }
+
+    #[test]
+    fn a_child_created_in_a_job_dies_when_its_parent_is_killed() {
+        let (read, write) = anonymous_pipe().unwrap();
+        let input = null_device().unwrap();
+        let supervisor = {
+            let mut launch = Launch::new(std::env::current_exe().unwrap());
+            launch
+                .args([
+                    "--exact",
+                    "launch::tests::supervisor_process_for_the_killed_parent_test",
+                ])
+                .stdin(&input);
+            let report = launch.inherit(&write).unwrap();
+            launch.env(SUPERVISOR_REPORT, report.to_string());
+            TerminateOnDrop(launch.spawn().unwrap())
+        };
+        drop(write);
+        let mut pid = [0_u8; 4];
+        File::from(read)
+            .read_exact(&mut pid)
+            .expect("the supervisor reports its child before it waits");
+        // Opened while the supervisor still holds the child, so the process
+        // ID cannot have been reused.
+        let child = TerminateOnDrop(
+            crate::Process::open(u32::from_le_bytes(pid), ProcessAccess::Terminate).unwrap(),
+        );
+        assert_eq!(
+            child.0.wait(Some(Duration::from_millis(200))).unwrap(),
+            WaitOutcome::TimedOut
+        );
+
+        // TerminateProcess runs none of the supervisor's destructors, so only
+        // the kernel closing its job handle can end the child.
+        supervisor.0.terminate(1).unwrap();
+        assert_eq!(
+            supervisor.0.wait(Some(Duration::from_secs(30))).unwrap(),
+            WaitOutcome::Signaled
+        );
+        assert_eq!(
+            child.0.wait(Some(Duration::from_secs(30))).unwrap(),
             WaitOutcome::Signaled
         );
     }

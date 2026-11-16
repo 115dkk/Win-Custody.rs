@@ -200,6 +200,13 @@ impl Job {
 
     /// Assigns `process` to the job. The handle needs `PROCESS_SET_QUOTA`
     /// and `PROCESS_TERMINATE`, which a process this one created has.
+    ///
+    /// Until this returns, the process is outside the job. For a child you
+    /// are about to create, use [`Launch::spawn_in_job`](crate::Launch::spawn_in_job)
+    /// or [`Launch::spawn_suspended_in_job`](crate::Launch::spawn_suspended_in_job),
+    /// which create it inside the job; a child created first and assigned
+    /// afterwards outlives a kill-on-close job if this process is killed
+    /// between the two steps.
     pub fn assign(&self, process: &impl AsHandle) -> io::Result<()> {
         let process = process.as_handle().as_raw_handle();
         // SAFETY: both handles are live for the call.
