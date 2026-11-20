@@ -34,7 +34,9 @@
 //! a Less Privileged AppContainer (LPAC). It keeps everything Windows grants
 //! to `ALL APPLICATION PACKAGES`, and the launch cannot be combined with
 //! [`Launch::as_user`]. Access given with [`AppContainerProfile::grant_path`]
-//! is written into the files' ACLs and outlives the process and the profile.
+//! is written into the files' ACLs and outlives the process and the profile;
+//! [`AppContainerProfile::ensure_path_access`] avoids writing when the access
+//! is already present.
 //! For code that needs stronger isolation, use a separate low-privilege
 //! account.
 //!

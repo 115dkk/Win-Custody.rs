@@ -7,20 +7,24 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::Path;
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{LocalFree, GENERIC_READ, GENERIC_WRITE};
+use windows_sys::Win32::Foundation::{LocalFree, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE};
 use windows_sys::Win32::Globalization::lstrlenW;
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW,
-    EXPLICIT_ACCESS_W, SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_GROUP, TRUSTEE_IS_SID, TRUSTEE_W,
+    ConvertSidToStringSidW, GetEffectiveRightsFromAclW, GetNamedSecurityInfoW, SetEntriesInAclW,
+    SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_GROUP,
+    TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{
-    DeriveCapabilitySidsFromName, FreeSid, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-    OBJECT_INHERIT_ACE, PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
+    CreateWellKnownSid, DeriveCapabilitySidsFromName, FreeSid, MapGenericMask,
+    WinBuiltinAnyPackageSid, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
+    GENERIC_MAPPING, OBJECT_INHERIT_ACE, PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
 };
-use windows_sys::Win32::Storage::FileSystem::DELETE;
+use windows_sys::Win32::Storage::FileSystem::{
+    DELETE, FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+};
 use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
 
 use crate::wide::wide_null;
@@ -219,11 +223,68 @@ impl AppContainerProfile {
     ///
     /// The grant is persistent: it stays after this value is dropped, after
     /// the launched processes exit and after the profile is deleted, and this
-    /// crate has no call to remove it. [`AppContainerAccess::ReadWrite`] also
-    /// grants delete access, so a child can replace files inside a writable
-    /// directory.
+    /// crate has no call to remove it. [`AppContainerAccess::ReadWrite`] and
+    /// [`AppContainerAccess::ReadWriteExecute`] also grant delete access, so a
+    /// child can replace files inside a writable directory.
     pub fn grant_path(&self, path: impl AsRef<Path>, access: AppContainerAccess) -> io::Result<()> {
         grant_sid_access(path.as_ref(), self.sid.0, access)
+    }
+
+    /// Gives processes in this profile `access` to `path` unless they already
+    /// have it, and returns whether it wrote an access rule.
+    ///
+    /// Access already granted to this profile's SID or to ALL APPLICATION
+    /// PACKAGES counts. When all requested rights are present, this does not
+    /// write, so it works on directories the caller cannot change, such as
+    /// Program Files, and does not rewrite a previously granted tree. A rule
+    /// written here is the same persistent rule that [`grant_path`](Self::grant_path)
+    /// writes.
+    pub fn ensure_path_access(
+        &self,
+        path: impl AsRef<Path>,
+        access: AppContainerAccess,
+    ) -> io::Result<bool> {
+        let path = path.as_ref();
+        let dacl = path_dacl(path)?;
+        let Some(dacl) = dacl.dacl else {
+            return Ok(false);
+        };
+        let profile_rights = effective_rights(dacl, self.sid.0, TRUSTEE_IS_GROUP)?;
+        let mut package_sid = [0_u32; 17];
+        let mut package_sid_bytes = std::mem::size_of_val(&package_sid) as u32;
+        // SAFETY: `package_sid` is an aligned, writable buffer large enough for
+        // the maximum SID, and `package_sid_bytes` is a local in/out length.
+        if unsafe {
+            CreateWellKnownSid(
+                WinBuiltinAnyPackageSid,
+                ptr::null_mut(),
+                package_sid.as_mut_ptr().cast(),
+                &mut package_sid_bytes,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let package_rights = effective_rights(
+            dacl,
+            package_sid.as_mut_ptr().cast(),
+            TRUSTEE_IS_WELL_KNOWN_GROUP,
+        )?;
+        let required = map_file_generic_mask(access_mask(access));
+        if (profile_rights | package_rights) & required == required {
+            return Ok(false);
+        }
+        grant_sid_access(path, self.sid.0, access)?;
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn effective_path_rights(&self, path: &Path) -> io::Result<u32> {
+        let dacl = path_dacl(path)?;
+        match dacl.dacl {
+            Some(dacl) => effective_rights(dacl, self.sid.0, TRUSTEE_IS_GROUP),
+            None => Ok(FILE_ALL_ACCESS),
+        }
     }
 
     pub(crate) fn security_capabilities(&self) -> SECURITY_CAPABILITIES {
@@ -248,6 +309,86 @@ pub enum AppContainerAccess {
     Read,
     /// Reads, writes, and deletes files, without execute access.
     ReadWrite,
+    /// Lists directories, reads files and attributes, and executes files.
+    /// Loading a DLL needs execute access, so grant this on a directory the
+    /// child loads code from.
+    ReadExecute,
+    /// Reads, writes, deletes and executes files.
+    ReadWriteExecute,
+}
+
+const fn access_mask(access: AppContainerAccess) -> u32 {
+    match access {
+        AppContainerAccess::Read => GENERIC_READ,
+        AppContainerAccess::ReadWrite => GENERIC_READ | GENERIC_WRITE | DELETE,
+        AppContainerAccess::ReadExecute => GENERIC_READ | GENERIC_EXECUTE,
+        AppContainerAccess::ReadWriteExecute => {
+            GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE
+        }
+    }
+}
+
+struct PathDacl {
+    dacl: Option<*mut ACL>,
+    _descriptor: LocalBlock,
+}
+
+fn path_dacl(path: &Path) -> io::Result<PathDacl> {
+    let path = wide_null(path.as_os_str())?;
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut descriptor = ptr::null_mut();
+    // SAFETY: `path` is NUL-terminated and both outputs are local pointers;
+    // Windows returns a LocalAlloc descriptor owned by `PathDacl`.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut dacl,
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    Ok(PathDacl {
+        dacl: if dacl.is_null() { None } else { Some(dacl) },
+        _descriptor: LocalBlock(descriptor.cast()),
+    })
+}
+
+fn effective_rights(dacl: *const ACL, sid: PSID, trustee_type: i32) -> io::Result<u32> {
+    let trustee = TRUSTEE_W {
+        pMultipleTrustee: ptr::null_mut(),
+        MultipleTrusteeOperation: 0,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: trustee_type,
+        ptstrName: sid.cast(),
+    };
+    let mut rights = 0_u32;
+    // SAFETY: `dacl` belongs to a live security descriptor, `sid` is live, the
+    // trustee describes that SID, and `rights` is a local output.
+    let status = unsafe { GetEffectiveRightsFromAclW(dacl, &trustee, &mut rights) };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    Ok(map_file_generic_mask(rights))
+}
+
+fn map_file_generic_mask(mut mask: u32) -> u32 {
+    const FILE_MAPPING: GENERIC_MAPPING = GENERIC_MAPPING {
+        GenericRead: FILE_GENERIC_READ,
+        GenericWrite: FILE_GENERIC_WRITE,
+        GenericExecute: FILE_GENERIC_EXECUTE,
+        GenericAll: FILE_ALL_ACCESS,
+    };
+    // SAFETY: both pointers refer to live local values for the duration of the
+    // call, which only replaces generic bits in `mask`.
+    unsafe { MapGenericMask(&mut mask, &FILE_MAPPING) };
+    mask
 }
 
 fn grant_sid_access(path: &Path, sid: PSID, access: AppContainerAccess) -> io::Result<()> {
@@ -273,10 +414,7 @@ fn grant_sid_access(path: &Path, sid: PSID, access: AppContainerAccess) -> io::R
     }
     let _descriptor = LocalBlock(descriptor.cast());
     let entry = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: match access {
-            AppContainerAccess::Read => GENERIC_READ,
-            AppContainerAccess::ReadWrite => GENERIC_READ | GENERIC_WRITE | DELETE,
-        },
+        grfAccessPermissions: access_mask(access),
         grfAccessMode: SET_ACCESS,
         grfInheritance: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
         Trustee: TRUSTEE_W {
@@ -358,7 +496,7 @@ impl Drop for AppContainerSid {
     }
 }
 
-struct DerivedCapability {
+pub(crate) struct DerivedCapability {
     capability_sids: Vec<PSID>,
     capability_array: *mut PSID,
     group_sids: Vec<PSID>,
@@ -366,7 +504,7 @@ struct DerivedCapability {
 }
 
 impl DerivedCapability {
-    fn from_name(name: &str) -> io::Result<Self> {
+    pub(crate) fn from_name(name: &str) -> io::Result<Self> {
         let name = wide_null(name)?;
         if name.len() <= 1 {
             return Err(io::Error::new(
@@ -430,6 +568,10 @@ impl DerivedCapability {
             ));
         }
         Ok(derived)
+    }
+
+    pub(crate) fn capability_sids(&self) -> &[PSID] {
+        &self.capability_sids
     }
 }
 

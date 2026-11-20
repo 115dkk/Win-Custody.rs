@@ -6,6 +6,19 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+### Added
+
+- `JobLimits::die_on_unhandled_exception` makes unhandled exceptions end job
+  processes without leaving them waiting behind the Windows Error Reporting
+  fault dialog.
+- `AppContainerAccess::ReadExecute` and `ReadWriteExecute` grant execute access
+  for executables and DLLs, with or without write and delete access.
+- `AppContainerProfile::ensure_path_access` checks the profile SID and ALL
+  APPLICATION PACKAGES before writing a persistent path grant, so existing
+  access does not require changing or rewriting the DACL.
+- `Process::has_capability` reports whether an AppContainer process token holds
+  a named Windows capability.
+
 ### Changed
 
 - `SECURITY.md` says when an advisory is also submitted to RustSec: when the
