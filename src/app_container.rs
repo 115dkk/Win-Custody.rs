@@ -3,6 +3,7 @@
 
 use std::ffi::OsString;
 use std::io;
+use std::mem::{offset_of, size_of};
 use std::os::windows::ffi::OsStringExt;
 use std::path::Path;
 use std::ptr;
@@ -10,22 +11,25 @@ use std::ptr;
 use windows_sys::Win32::Foundation::{LocalFree, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE};
 use windows_sys::Win32::Globalization::lstrlenW;
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, GetEffectiveRightsFromAclW, GetNamedSecurityInfoW, SetEntriesInAclW,
-    SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_GROUP,
-    TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
+    ConvertSidToStringSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW,
+    EXPLICIT_ACCESS_W, SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_GROUP, TRUSTEE_IS_SID, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{
-    CreateWellKnownSid, DeriveCapabilitySidsFromName, FreeSid, MapGenericMask,
-    WinBuiltinAnyPackageSid, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-    GENERIC_MAPPING, OBJECT_INHERIT_ACE, PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
+    AclSizeInformation, CreateWellKnownSid, DeriveCapabilitySidsFromName, EqualSid, FreeSid,
+    GetAce, GetAclInformation, GetLengthSid, IsValidSid, MapGenericMask, WinBuiltinAnyPackageSid,
+    ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
+    DACL_SECURITY_INFORMATION, GENERIC_MAPPING, INHERIT_ONLY_ACE, OBJECT_INHERIT_ACE, PSID,
+    SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
 };
-use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
+use windows_sys::Win32::System::SystemServices::{
+    ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, SE_GROUP_ENABLED,
+};
 
 use crate::wide::wide_null;
 
@@ -249,7 +253,6 @@ impl AppContainerProfile {
         let Some(dacl) = dacl.dacl else {
             return Ok(false);
         };
-        let profile_rights = effective_rights(dacl, self.sid.0, TRUSTEE_IS_GROUP)?;
         let mut package_sid = [0_u32; 17];
         let mut package_sid_bytes = std::mem::size_of_val(&package_sid) as u32;
         // SAFETY: `package_sid` is an aligned, writable buffer large enough for
@@ -265,13 +268,10 @@ impl AppContainerProfile {
         {
             return Err(io::Error::last_os_error());
         }
-        let package_rights = effective_rights(
-            dacl,
-            package_sid.as_mut_ptr().cast(),
-            TRUSTEE_IS_WELL_KNOWN_GROUP,
-        )?;
+        let package_sid = package_sid.as_mut_ptr().cast();
+        let granted = container_rights(dacl, &[self.sid.0, package_sid])?;
         let required = map_file_generic_mask(access_mask(access));
-        if (profile_rights | package_rights) & required == required {
+        if granted & required == required {
             return Ok(false);
         }
         grant_sid_access(path, self.sid.0, access)?;
@@ -282,7 +282,7 @@ impl AppContainerProfile {
     pub(crate) fn effective_path_rights(&self, path: &Path) -> io::Result<u32> {
         let dacl = path_dacl(path)?;
         match dacl.dacl {
-            Some(dacl) => effective_rights(dacl, self.sid.0, TRUSTEE_IS_GROUP),
+            Some(dacl) => container_rights(dacl, &[self.sid.0]),
             None => Ok(FILE_ALL_ACCESS),
         }
     }
@@ -360,22 +360,94 @@ fn path_dacl(path: &Path) -> io::Result<PathDacl> {
     })
 }
 
-fn effective_rights(dacl: *const ACL, sid: PSID, trustee_type: i32) -> io::Result<u32> {
-    let trustee = TRUSTEE_W {
-        pMultipleTrustee: ptr::null_mut(),
-        MultipleTrusteeOperation: 0,
-        TrusteeForm: TRUSTEE_IS_SID,
-        TrusteeType: trustee_type,
-        ptstrName: sid.cast(),
-    };
-    let mut rights = 0_u32;
-    // SAFETY: `dacl` belongs to a live security descriptor, `sid` is live, the
-    // trustee describes that SID, and `rights` is a local output.
-    let status = unsafe { GetEffectiveRightsFromAclW(dacl, &trustee, &mut rights) };
-    if status != 0 {
-        return Err(io::Error::from_raw_os_error(status as i32));
+/// The rights `dacl` gives a token whose AppContainer check sees exactly
+/// `sids`, evaluated as Windows evaluates `MAXIMUM_ALLOWED`: entries are read
+/// in order, inherit-only entries are skipped, and a denied bit stays denied
+/// when the deny entry precedes an allow. Object, callback, audit, mandatory
+/// label, and other ACE types do not participate in this check.
+fn container_rights(dacl: *const ACL, sids: &[PSID]) -> io::Result<u32> {
+    let mut size = ACL_SIZE_INFORMATION::default();
+    // SAFETY: `dacl` belongs to a live security descriptor and `size` is a
+    // writable output of the exact size declared to Windows.
+    if unsafe {
+        GetAclInformation(
+            dacl,
+            (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
+            size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
     }
-    Ok(map_file_generic_mask(rights))
+
+    let sid_offset = offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+    const SID_FIXED_BYTES: usize = 8;
+    let mut granted = 0_u32;
+    let mut denied = 0_u32;
+    for index in 0..size.AceCount {
+        let mut raw_ace = ptr::null_mut();
+        // SAFETY: `dacl` is live, `index` is below the ACE count returned for
+        // it, and `raw_ace` is a local output pointer.
+        if unsafe { GetAce(dacl, index, &mut raw_ace) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if raw_ace.is_null() {
+            return Err(invalid_acl("Windows returned a null ACE"));
+        }
+        let ace = raw_ace.cast::<ACCESS_ALLOWED_ACE>();
+        // SAFETY: GetAce returned a pointer to an ACE in the live ACL. Every ACE
+        // begins with an ACE_HEADER, which is the first field of this layout.
+        let header = unsafe { (*ace).Header };
+        if u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0 {
+            continue;
+        }
+        let kind = u32::from(header.AceType);
+        if kind != ACCESS_ALLOWED_ACE_TYPE && kind != ACCESS_DENIED_ACE_TYPE {
+            continue;
+        }
+        let ace_size = usize::from(header.AceSize);
+        if ace_size < sid_offset + SID_FIXED_BYTES {
+            return Err(invalid_acl("an access ACE is too short for its SID"));
+        }
+        // SAFETY: the ACE size check proves the fixed SID header starts inside
+        // this ACE.
+        let sid = unsafe { raw_ace.cast::<u8>().add(sid_offset).cast() };
+        // SAFETY: the fixed SID header is in bounds, so Windows may validate its
+        // revision and sub-authority count without reading beyond that header.
+        if unsafe { IsValidSid(sid) } == 0 {
+            return Err(invalid_acl("an access ACE contains an invalid SID"));
+        }
+        // SAFETY: IsValidSid accepted this SID.
+        let sid_length = unsafe { GetLengthSid(sid) } as usize;
+        if sid_length > ace_size - sid_offset {
+            return Err(invalid_acl("an access ACE SID exceeds the ACE"));
+        }
+        let matches = sids.iter().any(|expected| {
+            if expected.is_null() {
+                return false;
+            }
+            // SAFETY: `sid` passed validation and lies in the live ACL; the
+            // caller supplies live SIDs for this evaluation.
+            unsafe { EqualSid(*expected, sid) != 0 }
+        });
+        if !matches {
+            continue;
+        }
+        // SAFETY: the ACE size check above is longer than the complete fixed
+        // ACCESS_ALLOWED_ACE fields, including Mask.
+        let mask = map_file_generic_mask(unsafe { (*ace).Mask });
+        if kind == ACCESS_ALLOWED_ACE_TYPE {
+            granted |= mask & !denied;
+        } else {
+            denied |= mask & !granted;
+        }
+    }
+    Ok(granted)
+}
+
+fn invalid_acl(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 fn map_file_generic_mask(mut mask: u32) -> u32 {

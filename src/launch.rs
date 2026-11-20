@@ -949,7 +949,7 @@ mod tests {
     use std::os::windows::ffi::OsStringExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
     use std::path::Path;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::{ERROR_NOT_ENOUGH_QUOTA, GENERIC_READ, GENERIC_WRITE};
     use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_EXECUTE;
@@ -1256,6 +1256,62 @@ mod tests {
             })
             .collect();
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn a_profile_deny_precedes_the_package_allow() {
+        let profile = ProfileGuard::new("denied-execute");
+        let directory = tempfile::tempdir().unwrap();
+        let current_user = current_user_sid_string().unwrap();
+        let profile_sid = profile.profile().sid_string().unwrap();
+        let descriptor = SecurityDescriptor::from_sddl(&format!(
+            "D:P(A;OICI;FA;;;{current_user})(D;OICI;GX;;;{profile_sid})(A;OICI;GRGX;;;AC)"
+        ))
+        .unwrap();
+        descriptor.apply_to_tree(directory.path(), true).unwrap();
+
+        assert!(profile
+            .profile()
+            .ensure_path_access(directory.path(), AppContainerAccess::ReadExecute)
+            .unwrap());
+    }
+
+    #[test]
+    fn an_inherit_only_package_rule_does_not_grant_the_directory_access() {
+        let profile = ProfileGuard::new("inherit-only");
+        let directory = tempfile::tempdir().unwrap();
+        let current_user = current_user_sid_string().unwrap();
+        let descriptor = SecurityDescriptor::from_sddl(&format!(
+            "D:P(A;OICI;FA;;;{current_user})(A;OICIIO;GRGX;;;AC)"
+        ))
+        .unwrap();
+        descriptor.apply_to_tree(directory.path(), true).unwrap();
+
+        assert!(profile
+            .profile()
+            .ensure_path_access(directory.path(), AppContainerAccess::ReadExecute)
+            .unwrap());
+    }
+
+    #[test]
+    fn repeated_path_access_checks_finish_without_authz_delay() {
+        let profile = ProfileGuard::new("ensure-timing");
+        let directory = tempfile::tempdir().unwrap();
+        assert!(profile
+            .profile()
+            .ensure_path_access(directory.path(), AppContainerAccess::ReadExecute)
+            .unwrap());
+
+        let started = Instant::now();
+        for _ in 0..20 {
+            assert!(!profile
+                .profile()
+                .ensure_path_access(directory.path(), AppContainerAccess::ReadExecute)
+                .unwrap());
+        }
+        let elapsed = started.elapsed();
+        eprintln!("20 repeated ensure_path_access calls took {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(2), "elapsed: {elapsed:?}");
     }
 
     #[test]
