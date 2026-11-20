@@ -943,35 +943,28 @@ fn append_argument(line: &mut Vec<u16>, argument: &OsStr) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::{c_void, OsString};
+    use std::ffi::OsString;
     use std::fs::File;
     use std::io::{Read, Write};
-    use std::mem::size_of;
     use std::os::windows::ffi::OsStringExt;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
     use std::path::Path;
-    use std::ptr::{null_mut, NonNull};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use windows_sys::Win32::Foundation::{
-        LocalFree, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_ENOUGH_QUOTA, GENERIC_READ, GENERIC_WRITE,
-    };
-    use windows_sys::Win32::Globalization::lstrlenW;
-    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-    use windows_sys::Win32::Security::{
-        GetTokenInformation, TokenCapabilities, TOKEN_GROUPS, TOKEN_QUERY,
-    };
+    use windows_sys::Win32::Foundation::{ERROR_NOT_ENOUGH_QUOTA, GENERIC_READ, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_EXECUTE;
     use windows_sys::Win32::System::JobObjects::IsProcessInJob;
-    use windows_sys::Win32::System::Threading::OpenProcessToken;
 
     use super::{
         anonymous_pipe, command_line, command_line_tail, null_device, read_to_end_bounded, Launch,
     };
-    use crate::handle::{owned_from_creation, WaitOutcome};
+    use crate::handle::WaitOutcome;
     use crate::job::{Job, JobLimits};
     use crate::pipe::{PipeDirection, PipeServer, PipeWait};
     use crate::process::ProcessAccess;
-    use crate::security::{current_user_sid_string, SecurityDescriptor};
+    use crate::security::{
+        current_user_sid_string, ObjectSecurityDescriptor, OwnedSid, SecurityDescriptor,
+    };
     use crate::{AppContainerAccess, AppContainerProfile, PrimaryToken};
 
     fn cmd() -> std::path::PathBuf {
@@ -1020,120 +1013,6 @@ mod tests {
                 let _ = profile.delete();
             }
         }
-    }
-
-    fn token_capability_sids(process: &crate::Process) -> std::io::Result<Vec<String>> {
-        let mut raw_token = null_mut();
-        // SAFETY: the child process handle is live and `raw_token` is a local
-        // output whose returned handle is immediately wrapped as owned.
-        if unsafe { OpenProcessToken(process.as_raw_handle(), TOKEN_QUERY, &mut raw_token) } == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let token: OwnedHandle = owned_from_creation(raw_token)?;
-        let mut needed = 0_u32;
-        // SAFETY: this is the documented null-buffer sizing probe and `needed`
-        // is a live output pointer.
-        let probed = unsafe {
-            GetTokenInformation(
-                token.as_raw_handle(),
-                TokenCapabilities,
-                null_mut(),
-                0,
-                &mut needed,
-            )
-        };
-        if probed != 0
-            || std::io::Error::last_os_error().raw_os_error()
-                != Some(ERROR_INSUFFICIENT_BUFFER as i32)
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        if needed < size_of::<TOKEN_GROUPS>() as u32 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "TokenCapabilities buffer is shorter than TOKEN_GROUPS",
-            ));
-        }
-        let words = (needed as usize).div_ceil(size_of::<usize>());
-        let mut storage = vec![0_usize; words];
-        let capacity = storage.len() * size_of::<usize>();
-        // SAFETY: `storage` is word-aligned and writable for at least `needed`
-        // bytes; the token and output length are live for this call.
-        if unsafe {
-            GetTokenInformation(
-                token.as_raw_handle(),
-                TokenCapabilities,
-                storage.as_mut_ptr().cast(),
-                needed,
-                &mut needed,
-            )
-        } == 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        let groups = storage.as_ptr().cast::<TOKEN_GROUPS>();
-        // SAFETY: the successful call initialized a TOKEN_GROUPS header in the
-        // validated, aligned buffer.
-        let count = unsafe { (*groups).GroupCount as usize };
-        let groups_offset = std::mem::offset_of!(TOKEN_GROUPS, Groups);
-        let groups_bytes = count
-            .checked_mul(size_of::<windows_sys::Win32::Security::SID_AND_ATTRIBUTES>())
-            .and_then(|bytes| groups_offset.checked_add(bytes))
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "TokenCapabilities group count overflows",
-                )
-            })?;
-        if groups_bytes > needed as usize || needed as usize > capacity {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "TokenCapabilities group array exceeds its buffer",
-            ));
-        }
-        // SAFETY: `groups_offset` lies within the validated token information
-        // buffer, so advancing to the Groups member stays in its allocation.
-        let entries_pointer = unsafe { storage.as_ptr().cast::<u8>().add(groups_offset) };
-        // SAFETY: the validated byte range contains `count` contiguous entries
-        // beginning at `entries_pointer`.
-        let entries: &[windows_sys::Win32::Security::SID_AND_ATTRIBUTES] =
-            unsafe { std::slice::from_raw_parts(entries_pointer.cast(), count) };
-        entries
-            .iter()
-            .map(|entry| sid_to_string(entry.Sid))
-            .collect()
-    }
-
-    fn sid_to_string(sid: *mut c_void) -> std::io::Result<String> {
-        if NonNull::new(sid).is_none() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "token capability has a null SID",
-            ));
-        }
-        let mut text = null_mut();
-        // SAFETY: the SID comes from a validated live token information buffer;
-        // `text` is a local output receiving a LocalAlloc string.
-        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 || text.is_null() {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: the converter returned a live NUL-terminated UTF-16 string.
-        let length = unsafe { lstrlenW(text) };
-        if length < 0 {
-            // SAFETY: the string was allocated by ConvertSidToStringSidW.
-            unsafe { LocalFree(text.cast()) };
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "capability SID string length is invalid",
-            ));
-        }
-        // SAFETY: `length` counts initialized units before the terminating NUL.
-        let units = unsafe { std::slice::from_raw_parts(text, length as usize) };
-        let result = String::from_utf16(units)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
-        // SAFETY: the string was allocated by ConvertSidToStringSidW.
-        unsafe { LocalFree(text.cast()) };
-        result
     }
 
     fn rendered(arguments: &[&str]) -> String {
@@ -1223,6 +1102,7 @@ mod tests {
             .spawn_in_job(&job)
             .unwrap();
         assert!(child.is_app_container().unwrap());
+        assert!(!child.has_capability("internetClient").unwrap());
         drop(write);
         let output = read_to_end_bounded(&read, 4096).unwrap();
         assert_eq!(
@@ -1296,13 +1176,204 @@ mod tests {
             .app_container(profile.profile())
             .spawn_suspended()
             .unwrap();
-        let capabilities = token_capability_sids(child.process()).unwrap();
-        assert!(capabilities.iter().any(|sid| sid == "S-1-15-3-1"));
+        assert!(child.process().has_capability("internetClient").unwrap());
+        assert!(!child
+            .process()
+            .has_capability("internetClientServer")
+            .unwrap());
         child.process().terminate(0).unwrap();
         assert_eq!(
             child.process().wait(Some(Duration::from_secs(30))).unwrap(),
             WaitOutcome::Signaled
         );
+    }
+
+    #[test]
+    fn ensuring_path_access_writes_only_missing_rights() {
+        let profile = ProfileGuard::new("ensure");
+        let directory = tempfile::tempdir().unwrap();
+        assert!(profile
+            .profile()
+            .ensure_path_access(directory.path(), AppContainerAccess::ReadExecute)
+            .unwrap());
+        assert!(!profile
+            .profile()
+            .ensure_path_access(directory.path(), AppContainerAccess::ReadExecute)
+            .unwrap());
+        assert!(profile
+            .profile()
+            .ensure_path_access(directory.path(), AppContainerAccess::ReadWriteExecute)
+            .unwrap());
+    }
+
+    #[test]
+    fn all_application_packages_access_avoids_writing_the_dacl() {
+        let profile = ProfileGuard::new("packages-access");
+        let directory = tempfile::tempdir().unwrap();
+        let current_user = current_user_sid_string().unwrap();
+        let descriptor = SecurityDescriptor::from_sddl(&format!(
+            "D:P(A;OICI;FA;;;{current_user})(A;OICI;GRGX;;;AC)"
+        ))
+        .unwrap();
+        descriptor.apply_to_tree(directory.path(), true).unwrap();
+        let current_user = OwnedSid::from_string(&current_user).unwrap();
+        let packages = OwnedSid::from_string("AC").unwrap();
+        let before = ObjectSecurityDescriptor::query_file(directory.path()).unwrap();
+        let before: Vec<_> = before
+            .dacl()
+            .unwrap()
+            .allowed_aces()
+            .map(|ace| {
+                (
+                    ace.flags(),
+                    ace.mask(),
+                    ace.trustee_matches(&current_user),
+                    ace.trustee_matches(&packages),
+                )
+            })
+            .collect();
+
+        assert!(!profile
+            .profile()
+            .ensure_path_access(directory.path(), AppContainerAccess::ReadExecute)
+            .unwrap());
+
+        let profile_sid = OwnedSid::from_string(&profile.profile().sid_string().unwrap()).unwrap();
+        let after = ObjectSecurityDescriptor::query_file(directory.path()).unwrap();
+        let dacl = after.dacl().unwrap();
+        assert!(!dacl
+            .allowed_aces()
+            .any(|ace| ace.trustee_matches(&profile_sid)));
+        let after: Vec<_> = dacl
+            .allowed_aces()
+            .map(|ace| {
+                (
+                    ace.flags(),
+                    ace.mask(),
+                    ace.trustee_matches(&current_user),
+                    ace.trustee_matches(&packages),
+                )
+            })
+            .collect();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn a_profile_deny_precedes_the_package_allow() {
+        let profile = ProfileGuard::new("denied-execute");
+        let directory = tempfile::tempdir().unwrap();
+        let current_user = current_user_sid_string().unwrap();
+        let profile_sid = profile.profile().sid_string().unwrap();
+        let descriptor = SecurityDescriptor::from_sddl(&format!(
+            "D:P(A;OICI;FA;;;{current_user})(D;OICI;GX;;;{profile_sid})(A;OICI;GRGX;;;AC)"
+        ))
+        .unwrap();
+        descriptor.apply_to_tree(directory.path(), true).unwrap();
+
+        assert!(profile
+            .profile()
+            .ensure_path_access(directory.path(), AppContainerAccess::ReadExecute)
+            .unwrap());
+    }
+
+    #[test]
+    fn an_inherit_only_package_rule_does_not_grant_the_directory_access() {
+        let profile = ProfileGuard::new("inherit-only");
+        let directory = tempfile::tempdir().unwrap();
+        let current_user = current_user_sid_string().unwrap();
+        let descriptor = SecurityDescriptor::from_sddl(&format!(
+            "D:P(A;OICI;FA;;;{current_user})(A;OICIIO;GRGX;;;AC)"
+        ))
+        .unwrap();
+        descriptor.apply_to_tree(directory.path(), true).unwrap();
+
+        assert!(profile
+            .profile()
+            .ensure_path_access(directory.path(), AppContainerAccess::ReadExecute)
+            .unwrap());
+    }
+
+    #[test]
+    fn repeated_path_access_checks_finish_without_authz_delay() {
+        let profile = ProfileGuard::new("ensure-timing");
+        let directory = tempfile::tempdir().unwrap();
+        assert!(profile
+            .profile()
+            .ensure_path_access(directory.path(), AppContainerAccess::ReadExecute)
+            .unwrap());
+
+        let started = Instant::now();
+        for _ in 0..20 {
+            assert!(!profile
+                .profile()
+                .ensure_path_access(directory.path(), AppContainerAccess::ReadExecute)
+                .unwrap());
+        }
+        let elapsed = started.elapsed();
+        eprintln!("20 repeated ensure_path_access calls took {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(2), "elapsed: {elapsed:?}");
+    }
+
+    #[test]
+    fn read_execute_grant_includes_file_execute_rights() {
+        let profile = ProfileGuard::new("execute-rights");
+        let directory = tempfile::tempdir().unwrap();
+        profile
+            .profile()
+            .grant_path(directory.path(), AppContainerAccess::ReadExecute)
+            .unwrap();
+        let rights = profile
+            .profile()
+            .effective_path_rights(directory.path())
+            .unwrap();
+        assert_eq!(rights & FILE_GENERIC_EXECUTE, FILE_GENERIC_EXECUTE);
+    }
+
+    const APPCONTAINER_SELF_CHECK: &str = "WIN_CUSTODY_TEST_SELF_CHECK";
+
+    #[test]
+    #[ignore = "run by appcontainer_capability_is_visible_inside_the_child"]
+    fn appcontainer_process_reports_its_capability() {
+        if std::env::var_os(APPCONTAINER_SELF_CHECK) != Some(OsString::from("1")) {
+            return;
+        }
+        let process =
+            crate::Process::open(std::process::id(), ProcessAccess::QueryLimited).unwrap();
+        assert!(process.is_app_container().unwrap());
+        assert!(process.has_capability("internetClient").unwrap());
+        assert!(!process.has_capability("internetClientServer").unwrap());
+    }
+
+    #[test]
+    fn appcontainer_capability_is_visible_inside_the_child() {
+        let profile = ProfileGuard::with_capabilities("self-check", &["internetClient"]);
+        let current =
+            crate::Process::open(std::process::id(), ProcessAccess::QueryLimited).unwrap();
+        assert!(!current.has_capability("internetClient").unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("win-custody-self-check.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        assert!(profile
+            .profile()
+            .ensure_path_access(directory.path(), AppContainerAccess::ReadExecute)
+            .unwrap());
+        let child = Launch::new(&executable)
+            .args([
+                "--exact",
+                "launch::tests::appcontainer_process_reports_its_capability",
+                "--ignored",
+            ])
+            .env(APPCONTAINER_SELF_CHECK, "1")
+            .app_container(profile.profile())
+            .spawn_suspended()
+            .unwrap();
+        assert!(child.process().has_capability("internetClient").unwrap());
+        let child = child.resume().unwrap();
+        assert_eq!(
+            child.wait(Some(Duration::from_secs(30))).unwrap(),
+            WaitOutcome::Signaled
+        );
+        assert_eq!(child.exit_code().unwrap(), Some(0));
     }
 
     #[test]

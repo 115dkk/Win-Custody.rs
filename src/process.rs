@@ -11,10 +11,11 @@ use std::ptr;
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    DuplicateHandle, DUPLICATE_SAME_ACCESS, FILETIME, STILL_ACTIVE,
+    DuplicateHandle, DUPLICATE_SAME_ACCESS, ERROR_INSUFFICIENT_BUFFER, FILETIME, STILL_ACTIVE,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, TokenElevation, TokenIsAppContainer, TOKEN_ELEVATION, TOKEN_QUERY,
+    EqualSid, GetTokenInformation, TokenCapabilities, TokenElevation, TokenIsAppContainer,
+    SID_AND_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_QUERY,
 };
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::System::Threading::{
@@ -25,6 +26,7 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
+use crate::app_container::DerivedCapability;
 use crate::handle::{current_process, owned_from_creation, wait, WaitOutcome};
 use crate::launch::command_line_tail;
 use crate::wide::wide_null;
@@ -260,6 +262,32 @@ impl Process {
         Ok(is_app_container != 0)
     }
 
+    /// Whether the process's token holds the Windows capability `name`, such as
+    /// `internetClient`.
+    ///
+    /// The name is turned into SIDs the same way
+    /// [`AppContainerProfile::create_or_open_with_capabilities`](crate::AppContainerProfile::create_or_open_with_capabilities)
+    /// does. Windows accepts misspelled names, but no token holds the resulting
+    /// capability. A process outside an AppContainer holds no capabilities. The
+    /// handle needs `PROCESS_QUERY_LIMITED_INFORMATION`, which every
+    /// [`ProcessAccess`] variant except [`ProcessAccess::Synchronize`] includes.
+    pub fn has_capability(&self, name: &str) -> io::Result<bool> {
+        if !self.is_app_container()? {
+            return Ok(false);
+        }
+        let required = DerivedCapability::from_name(name)?;
+        let held = token_capability_sids(self)?;
+        Ok(required.capability_sids().iter().all(|required_sid| {
+            !required_sid.is_null()
+                && held.iter().any(|held_sid| {
+                    let held_sid = held_sid.as_ptr().cast_mut().cast();
+                    // SAFETY: both pointers address complete, live SID
+                    // allocations for this comparison.
+                    unsafe { EqualSid(*required_sid, held_sid) != 0 }
+                })
+        }))
+    }
+
     /// The full Win32 path of the process image.
     pub fn image_path(&self) -> io::Result<PathBuf> {
         let mut buffer = vec![0_u16; MAX_IMAGE_PATH_UNITS];
@@ -309,6 +337,137 @@ impl Process {
     fn raw(&self) -> RawHandle {
         self.handle.as_raw_handle()
     }
+}
+
+pub(crate) fn token_capability_sids(process: &Process) -> io::Result<Vec<Vec<u32>>> {
+    let mut raw_token = ptr::null_mut();
+    // SAFETY: the process handle is live and `raw_token` is a local output whose
+    // returned handle is immediately wrapped as owned.
+    if unsafe { OpenProcessToken(process.raw(), TOKEN_QUERY, &mut raw_token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let token = owned_from_creation(raw_token)?;
+    let mut needed = 0_u32;
+    // SAFETY: this is the documented null-buffer sizing probe and `needed` is a
+    // live output pointer.
+    let probed = unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenCapabilities,
+            ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    let probe_error = io::Error::last_os_error();
+    if probed != 0 || probe_error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+        return Err(probe_error);
+    }
+    if needed < size_of::<u32>() as u32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TokenCapabilities buffer is shorter than its group count",
+        ));
+    }
+    let words = (needed as usize).div_ceil(size_of::<usize>());
+    let mut storage = vec![0_usize; words];
+    let capacity = storage.len() * size_of::<usize>();
+    // SAFETY: `storage` is word-aligned and writable for at least `needed`
+    // bytes; the token and output length are live for this call.
+    if unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenCapabilities,
+            storage.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if needed as usize > capacity || needed < size_of::<u32>() as u32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TokenCapabilities result exceeds its buffer",
+        ));
+    }
+    // SAFETY: the successful call initialized the group count in this aligned
+    // buffer, and its returned size includes that field.
+    let count = unsafe { *storage.as_ptr().cast::<u32>() as usize };
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let groups_offset = std::mem::offset_of!(TOKEN_GROUPS, Groups);
+    let groups_bytes = count
+        .checked_mul(size_of::<SID_AND_ATTRIBUTES>())
+        .and_then(|bytes| groups_offset.checked_add(bytes))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TokenCapabilities group count overflows",
+            )
+        })?;
+    if groups_bytes > needed as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TokenCapabilities group array exceeds its buffer",
+        ));
+    }
+    // SAFETY: `groups_offset` lies within the validated token information
+    // buffer, so advancing to the Groups member stays in its allocation.
+    let entries_pointer = unsafe { storage.as_ptr().cast::<u8>().add(groups_offset) };
+    // SAFETY: the validated byte range contains `count` contiguous entries
+    // beginning at `entries_pointer`.
+    let entries =
+        unsafe { std::slice::from_raw_parts(entries_pointer.cast::<SID_AND_ATTRIBUTES>(), count) };
+    // SAFETY: the successful call initialized `needed` bytes in `storage`, and
+    // the capacity check above proves that range lies inside the allocation.
+    let bytes =
+        unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), needed as usize) };
+    entries
+        .iter()
+        .map(|entry| copy_sid_from_token_buffer(entry.Sid, bytes))
+        .collect()
+}
+
+fn copy_sid_from_token_buffer(sid: *mut std::ffi::c_void, buffer: &[u8]) -> io::Result<Vec<u32>> {
+    const SID_FIXED_BYTES: usize = 8;
+    let offset = (sid as usize)
+        .checked_sub(buffer.as_ptr() as usize)
+        .filter(|offset| *offset <= buffer.len().saturating_sub(SID_FIXED_BYTES))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a token capability SID lies outside the returned buffer",
+            )
+        })?;
+    let sub_authorities = usize::from(buffer[offset + 1]);
+    let length = sub_authorities
+        .checked_mul(size_of::<u32>())
+        .and_then(|bytes| SID_FIXED_BYTES.checked_add(bytes))
+        .filter(|length| {
+            offset
+                .checked_add(*length)
+                .is_some_and(|end| end <= buffer.len())
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a token capability SID exceeds the returned buffer",
+            )
+        })?;
+    let mut copy = vec![0_u32; length.div_ceil(size_of::<u32>())];
+    // SAFETY: this mutable byte view covers the initialized u32 allocation and
+    // does not outlive `copy`.
+    let copy_bytes = unsafe {
+        std::slice::from_raw_parts_mut(
+            copy.as_mut_ptr().cast::<u8>(),
+            copy.len() * size_of::<u32>(),
+        )
+    };
+    copy_bytes[..length].copy_from_slice(&buffer[offset..offset + length]);
+    Ok(copy)
 }
 
 impl AsHandle for Process {

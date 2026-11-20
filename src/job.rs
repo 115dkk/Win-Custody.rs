@@ -10,8 +10,8 @@ use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
-    JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+    JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_JOB_MEMORY,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
 };
 
 use crate::handle::{current_process, owned_from_creation};
@@ -36,6 +36,7 @@ use crate::security::SecurityDescriptor;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct JobLimits {
     kill_on_close: bool,
+    die_on_unhandled_exception: bool,
     active_processes: Option<u32>,
     process_memory: Option<usize>,
     job_memory: Option<usize>,
@@ -46,6 +47,7 @@ impl JobLimits {
     pub const fn new() -> Self {
         Self {
             kill_on_close: false,
+            die_on_unhandled_exception: false,
             active_processes: None,
             process_memory: None,
             job_memory: None,
@@ -57,6 +59,17 @@ impl JobLimits {
     #[must_use]
     pub const fn kill_on_close(mut self, enabled: bool) -> Self {
         self.kill_on_close = enabled;
+        self
+    }
+
+    /// Makes every process in the job behave as if it called
+    /// `SetErrorMode(SEM_NOGPFAULTERRORBOX)`. A debugger still gets a chance to
+    /// handle an unhandled exception. Without one, the process ends with the
+    /// exception code as its exit code instead of waiting behind the Windows
+    /// Error Reporting fault dialog.
+    #[must_use]
+    pub const fn die_on_unhandled_exception(mut self, enabled: bool) -> Self {
+        self.die_on_unhandled_exception = enabled;
         self
     }
 
@@ -85,6 +98,12 @@ impl JobLimits {
     /// Whether the job kills its processes when its last handle closes.
     pub const fn kills_on_close(&self) -> bool {
         self.kill_on_close
+    }
+
+    /// Whether processes in the job end on an unhandled exception instead of
+    /// waiting behind the fault dialog.
+    pub const fn dies_on_unhandled_exception(&self) -> bool {
+        self.die_on_unhandled_exception
     }
 
     /// The active-process limit, if one is set.
@@ -121,6 +140,9 @@ impl JobLimits {
         if self.kill_on_close {
             basic.LimitFlags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         }
+        if self.die_on_unhandled_exception {
+            basic.LimitFlags |= JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+        }
         if let Some(limit) = self.active_processes {
             basic.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
             basic.ActiveProcessLimit = limit;
@@ -140,6 +162,7 @@ impl JobLimits {
         let flags = raw.BasicLimitInformation.LimitFlags;
         Self {
             kill_on_close: flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE != 0,
+            die_on_unhandled_exception: flags & JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION != 0,
             active_processes: (flags & JOB_OBJECT_LIMIT_ACTIVE_PROCESS != 0)
                 .then_some(raw.BasicLimitInformation.ActiveProcessLimit),
             process_memory: (flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0)
@@ -292,6 +315,7 @@ mod tests {
     fn limits_read_back_as_they_were_set() {
         let limits = JobLimits::new()
             .kill_on_close(true)
+            .die_on_unhandled_exception(true)
             .active_processes(1)
             .process_memory(256 * 1024 * 1024)
             .job_memory(512 * 1024 * 1024);

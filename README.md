@@ -13,7 +13,7 @@ owned types.
 | inherit exactly the handles you name, nothing else that is inheritable in your process | `Launch` (explicit `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) |
 | die with you, even when your process is killed | `Job` with `JobLimits::kill_on_close`; `Launch::spawn_in_job` creates the child inside the job (`PROC_THREAD_ATTRIBUTE_JOB_LIST`) |
 | run as the logged-on user, or as your service on that user's desktop | `PrimaryToken::for_session_user`, `PrimaryToken::duplicate_current_process` + `set_session_id`, then `Launch::as_user` |
-| run in an AppContainer, with only the capabilities and paths you grant (opt-in) | `AppContainerProfile::create_or_open`, `grant_path`, then `Launch::app_container` |
+| run in an AppContainer, with only the capabilities and paths you grant (opt-in) | `AppContainerProfile::create_or_open`, `grant_path` or `ensure_path_access`, then `Launch::app_container` |
 | be reachable only by the principals you choose | `SecurityDescriptor::from_sddl` for `PipeServer`, `NamedMutex`, `Job` and directory trees |
 | prove who is on the other end of a pipe | `PipeServer::client_process_id`, `PipeClient::server_process_id` |
 | never block you forever | every pipe operation takes a `PipeWait` deadline and can end early when the peer exits |
@@ -98,9 +98,10 @@ that is before relying on it:
 - It cannot be combined with `Launch::as_user`: the profile belongs to the
   calling user, not to the token's user, and the launch fails with
   `InvalidInput`.
-- `AppContainerProfile::grant_path` writes the grant into the files' ACLs. On
-  a directory it reaches everything already under it, and it stays after the
-  process exits and after the profile is deleted.
+- `AppContainerProfile::grant_path` writes the grant into the files' ACLs;
+  `ensure_path_access` skips that write when the rights are already present.
+  On a directory a written grant reaches everything already under it, and it
+  stays after the process exits and after the profile is deleted.
 
 For code that needs stronger isolation than that, use a separate
 low-privilege account.
